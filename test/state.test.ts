@@ -26,4 +26,16 @@ describe("initial key behavior", () => {
     expect(reduceKey(state, { id: 7, type: "keyUp", vk: 65, scanCode: 30, key: "A", modifiers: 0 }))
       .toEqual({ state, consume: false });
   });
+  it("commits the top Rime candidate instead of raw pinyin", async () => {
+    const { SimpleEngine } = await import("../src/ime/engine.js");
+    const engine = new SimpleEngine();
+    let state = initialImeState();
+    for (const [id, key] of [[8, "n"], [9, "i"], [10, "h"], [11, "a"], [12, "o"]] as const) {
+      state = engine.processKey({ id, type: "keyDown", vk: key.charCodeAt(0), scanCode: 0, key, modifiers: 0 }, state).state;
+    }
+    const result = engine.processKey({ id: 13, type: "keyDown", vk: 32, scanCode: 0, key: " ", modifiers: 0 }, state);
+    expect(result.response.candidates?.[0]?.text).toBe("你好");
+    expect(result.response.commit).toBe("你好");
+    expect(result.state).toEqual({ composition: "" });
+  });
 });

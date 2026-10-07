@@ -10,12 +10,15 @@ export interface ImeEngine {
 export class SimpleEngine implements ImeEngine {
   processKey(event: KeyMessage, state: ImeState) {
     const result = reduceKey(state, event);
+    const candidates = result.commit !== undefined
+      ? getCandidates(state.composition)
+      : getCandidates(result.state.composition);
     const response: ResponseMessage = {
       id: event.id,
       consume: result.consume,
       composition: result.state.composition,
-      candidates: getCandidates(),
-      ...(result.commit !== undefined ? { commit: result.commit } : {}),
+      candidates,
+      ...(result.commit !== undefined ? { commit: candidates[0]?.text ?? result.commit } : {}),
     };
     return { state: result.state, response };
   }

@@ -2,6 +2,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { PROTOCOL_VERSION, type RequestMessage, type ResponseMessage } from "../protocol/messages.js";
 import { encodeMessage, JsonlDecoder, ProtocolError } from "../protocol/codec.js";
 import { SimpleEngine } from "../ime/engine.js";
+import { getCandidates } from "../ime/candidates.js";
 import { initialImeState, type ImeState } from "../ime/state.js";
 
 export const PIPE_NAME = "\\\\.\\pipe\\TypeScriptWindowsIME";
@@ -20,7 +21,7 @@ function handleMessage(message: RequestMessage, engine: SimpleEngine, state: Ime
         id: message.id,
         consume: message.composition.length > 0,
         composition: message.composition,
-        candidates: [],
+        candidates: getCandidates(message.composition),
       }, state };
     case "reset": return { response: { id: message.id, consume: false, composition: "" }, state: initialImeState() };
     case "keyDown":
