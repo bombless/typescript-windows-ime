@@ -1,0 +1,26 @@
+{
+  "name": "typescript-windows-ime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Windows TSF IME with a thin native adapter and a TypeScript logic core.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "install": "^0.13.0"
+  }
+}
