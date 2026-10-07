@@ -4,6 +4,8 @@
 #include <new>
 
 namespace {
+HRESULT RunComRegistration(bool unregister);
+
 volatile LONG g_serverLocks = 0;
 volatile LONG g_objectCount = 0;
 
@@ -61,8 +63,12 @@ HRESULT RegisterTipProfile() {
     ITfInputProcessorProfiles* profiles = nullptr; HRESULT hr = CreateProfiles(&profiles); if (FAILED(hr)) return hr;
     hr = profiles->Register(CLSID_TypeScriptWindowsIme);
     if (SUCCEEDED(hr)) {
-        hr = profiles->AddLanguageProfile(CLSID_TypeScriptWindowsIme, static_cast<LANGID>(0xFFFF), GUID_TypeScriptWindowsImeProfile,
-            kTypeScriptWindowsImeName, static_cast<ULONG>(-1), nullptr, 0, 0);
+        const LANGID languages[] = { 0x0409, 0x0804, 0x0411 };
+        for (const LANGID langid : languages) {
+            hr = profiles->AddLanguageProfile(CLSID_TypeScriptWindowsIme, langid, GUID_TypeScriptWindowsImeProfile,
+                kTypeScriptWindowsImeName, static_cast<ULONG>(-1), nullptr, 0, 0);
+            if (FAILED(hr)) break;
+        }
     }
     if (SUCCEEDED(hr)) {
         ITfCategoryMgr* categoryMgr = nullptr;
@@ -90,7 +96,15 @@ HRESULT SetRegString(HKEY root, const wchar_t* subKey, const wchar_t* valueName,
 }
 
 HRESULT RegisterComServer() {
-    wchar_t modulePath[MAX_PATH]{}; const DWORD length = GetModuleFileNameW(nullptr, modulePath, ARRAYSIZE(modulePath));
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&RunComRegistration),
+                            &module)) {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    wchar_t modulePath[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(module, modulePath, ARRAYSIZE(modulePath));
     if (length == 0 || length == ARRAYSIZE(modulePath)) return HRESULT_FROM_WIN32(GetLastError());
     const wchar_t* clsid = L"CLSID\\{7B2E4F5A-3A8E-4D74-9F0B-6D5D6F0E6C41}";
     HRESULT hr = SetRegString(HKEY_CLASSES_ROOT, clsid, nullptr, kTypeScriptWindowsImeName); if (FAILED(hr)) return hr;
