@@ -85,7 +85,7 @@ try {
 
     New-Item -ItemType Directory -Force -Path $staging | Out-Null
     Remove-Item $stagedDll, $stagedLib, $stagedExp -Force -ErrorAction SilentlyContinue
-    cl.exe /nologo /std:c++17 /EHsc /W4 /LD TsIme.cpp "$out\PipeBridge.obj" /link /OUT:"$stagedDll" /IMPLIB:"$stagedLib" /DEF:"TsIme.def" /SUBSYSTEM:WINDOWS advapi32.lib ole32.lib user32.lib
+    cl.exe /nologo /std:c++17 /EHsc /W4 /LD TsIme.cpp "$out\PipeBridge.obj" /link /OUT:"$stagedDll" /IMPLIB:"$stagedLib" /DEF:"TsIme.def" /SUBSYSTEM:WINDOWS advapi32.lib ole32.lib oleaut32.lib user32.lib
     if ($LASTEXITCODE -ne 0) { throw "Failed to link TypeScriptWindowsIme.dll." }
 
     try {

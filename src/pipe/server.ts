@@ -17,6 +17,15 @@ function logPipe(direction: "← C++" | "→ C++", message: unknown): void {
   try { appendFileSync("ts-pipe.log", line + "\n"); } catch {}
 }
 
+function logCandidates(response: ResponseMessage): void {
+  const candidates = response.candidates ?? [];
+  const selected = response.selectedCandidate ?? 0;
+  const texts = candidates.map((candidate, index) => `${index}=${candidate.text}`).join(" | ");
+  const line = `[CANDIDATES] count=${candidates.length} selected=${selected} composition=${JSON.stringify(response.composition ?? "")} commit=${JSON.stringify(response.commit ?? "")} :: ${texts}`;
+  console.log(line);
+  try { appendFileSync("ts-pipe.log", line + "\n"); } catch {}
+}
+
 function handleMessage(message: RequestMessage): ResponseMessage {
   switch (message.type) {
     case "hello":
@@ -54,6 +63,7 @@ function handleConnection(socket: Socket): void {
         logPipe("← C++", message);
         const response = handleMessage(message);
         logPipe("→ C++", response);
+        logCandidates(response);
         socket.write(encodeMessage(response));
       }
     } catch (error) {

@@ -79,6 +79,168 @@ std::string JsonString(const std::string& json, const char* key) {
     return {};
 }
 
+unsigned int JsonUInt(const std::string& json, const char* key, unsigned int fallback = 0) {
+    const std::string needle = std::string("\"") + key + "\":";
+    const size_t pos = json.find(needle);
+    if (pos == std::string::npos) return fallback;
+    const size_t value = pos + needle.size();
+    size_t end = value;
+    while (end < json.size() && json[end] >= '0' && json[end] <= '9') ++end;
+    if (end == value) return fallback;
+    try { return static_cast<unsigned int>(std::stoul(json.substr(value, end - value))); }
+    catch (...) { return fallback; }
+}
+
+std::vector<std::string> JsonCandidateTexts(const std::string& json) {
+    std::vector<std::string> candidates;
+    const std::string marker = "\"candidates\":[";
+    const size_t start = json.find(marker);
+    if (start == std::string::npos) return candidates;
+    size_t pos = start + marker.size();
+    while (pos < json.size()) {
+        const size_t object = json.find("{", pos);
+        const size_t arrayEnd = json.find("]", pos);
+        if (arrayEnd != std::string::npos && (object == std::string::npos || object > arrayEnd)) break;
+        if (object == std::string::npos) break;
+        const size_t text = json.find("\"text\":\"", object);
+        if (text == std::string::npos || (arrayEnd != std::string::npos && text > arrayEnd)) break;
+        size_t cursor = text + 8;
+        std::string value;
+        while (cursor < json.size()) {
+            const char c = json[cursor++];
+            if (c == '"') break;
+            if (c == '\\' && cursor < json.size()) {
+                const char escaped = json[cursor++];
+                switch (escaped) {
+                case 'n': value += '\n'; break;
+                case 'r': value += '\r'; break;
+                case 't': value += '\t'; break;
+                case '\\': value += '\\'; break;
+                case '"': value += '"'; break;
+                default: value += escaped; break;
+                }
+            } else value += c;
+        }
+        candidates.push_back(value);
+        pos = object + 1;
+    }
+    return candidates;
+}
+
+constexpr GUID kCandidateListUiElementGuid =
+    { 0x9f5b4d21, 0x4b54, 0x4f4f, { 0x9a, 0x2a, 0x7f, 0x32, 0x9e, 0x91, 0x4b, 0x16 } };
+
+class CandidateListUIElement final : public ITfCandidateListUIElementBehavior {
+public:
+    CandidateListUIElement(ITfDocumentMgr* documentMgr, std::vector<std::string> candidates, UINT selection)
+        : refCount_(1), documentMgr_(documentMgr), candidates_(std::move(candidates)), selection_(selection), shown_(TRUE) {
+        if (documentMgr_) documentMgr_->AddRef();
+    }
+    ~CandidateListUIElement() { if (documentMgr_) documentMgr_->Release(); }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (riid == IID_IUnknown || riid == IID_ITfUIElement || riid == IID_ITfCandidateListUIElement ||
+            riid == IID_ITfCandidateListUIElementBehavior) {
+            *object = static_cast<ITfCandidateListUIElementBehavior*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&refCount_)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG count = static_cast<ULONG>(InterlockedDecrement(&refCount_));
+        if (!count) delete this;
+        return count;
+    }
+    HRESULT STDMETHODCALLTYPE GetDescription(BSTR* description) override {
+        if (!description) return E_POINTER;
+        *description = SysAllocString(L"TypeScript Windows IME candidates");
+        return *description ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE GetGUID(GUID* guid) override {
+        if (!guid) return E_POINTER;
+        *guid = kCandidateListUiElementGuid;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Show(BOOL show) override { shown_ = show; return S_OK; }
+    HRESULT STDMETHODCALLTYPE IsShown(BOOL* show) override {
+        if (!show) return E_POINTER;
+        *show = shown_;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetUpdatedFlags(DWORD* flags) override {
+        if (!flags) return E_POINTER;
+        *flags = TF_CLUIE_DOCUMENTMGR | TF_CLUIE_COUNT | TF_CLUIE_SELECTION |
+            TF_CLUIE_STRING | TF_CLUIE_PAGEINDEX | TF_CLUIE_CURRENTPAGE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetDocumentMgr(ITfDocumentMgr** documentMgr) override {
+        if (!documentMgr) return E_POINTER;
+        *documentMgr = documentMgr_;
+        if (*documentMgr) (*documentMgr)->AddRef();
+        return *documentMgr ? S_OK : E_UNEXPECTED;
+    }
+    HRESULT STDMETHODCALLTYPE GetCount(UINT* count) override {
+        if (!count) return E_POINTER;
+        *count = static_cast<UINT>(candidates_.size());
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetSelection(UINT* index) override {
+        if (!index) return E_POINTER;
+        *index = selection_;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetString(UINT index, BSTR* string) override {
+        if (!string) return E_POINTER;
+        *string = nullptr;
+        if (index >= candidates_.size()) return E_INVALIDARG;
+        const std::wstring wide = Utf8ToWide(candidates_[index]);
+        *string = SysAllocStringLen(wide.data(), static_cast<UINT>(wide.size()));
+        return *string ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE GetPageIndex(UINT* index, UINT size, UINT* pageCount) override {
+        if (!pageCount) return E_POINTER;
+        *pageCount = 1;
+        if (size == 0) return S_OK;
+        if (!index) return E_POINTER;
+        const UINT count = static_cast<UINT>(candidates_.size());
+        const UINT limit = (size < count) ? size : count;
+        for (UINT i = 0; i < limit; ++i) index[i] = 0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetPageIndex(UINT*, UINT pageCount) override {
+        return pageCount == 1 ? S_OK : E_INVALIDARG;
+    }
+    HRESULT STDMETHODCALLTYPE GetCurrentPage(UINT* page) override {
+        if (!page) return E_POINTER;
+        *page = 0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetSelection(UINT index) override {
+        if (index >= candidates_.size()) return E_INVALIDARG;
+        selection_ = index;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Finalize() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE Abort() override { return S_OK; }
+
+    void Update(std::vector<std::string> candidates, UINT selection) {
+        candidates_ = std::move(candidates);
+        selection_ = candidates_.empty() ? 0 : (selection < candidates_.size() ? selection : 0);
+        shown_ = !candidates_.empty();
+    }
+
+private:
+    LONG refCount_;
+    ITfDocumentMgr* documentMgr_;
+    std::vector<std::string> candidates_;
+    UINT selection_;
+    BOOL shown_;
+};
+
 class CompositionSink final : public ITfCompositionSink {
 public:
     CompositionSink() : refCount_(1) {}
@@ -239,7 +401,7 @@ public:
     TextService()
         : refCount_(1), threadMgr_(nullptr), keyMgr_(nullptr), keySink_(nullptr),
           clientId_(TF_CLIENTID_NULL), keySinkAdvised_(false), nextRequestId_(1), pipe_(250), compositionContext_(nullptr),
-          compositionText_() {
+          compositionText_(), uiElementMgr_(nullptr), candidateElement_(nullptr), candidateUiElementId_(0) {
         InterlockedIncrement(&g_objectCount);
     }
 
@@ -339,6 +501,11 @@ public:
             composition_ = nullptr;
         }
         compositionText_.clear();
+        HideCandidates();
+        if (uiElementMgr_) {
+            uiElementMgr_->Release();
+            uiElementMgr_ = nullptr;
+        }
         NativeLog::Write("TextService::Deactivate complete this=%p", this);
         return S_OK;
     }
@@ -354,6 +521,8 @@ private:
     bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
                   std::string& response);
     bool ApplyResponse(ITfContext* context, const std::string& response);
+    bool UpdateCandidates(ITfContext* context, const std::string& response);
+    void HideCandidates();
 
     LONG refCount_;
     ITfThreadMgr* threadMgr_;
@@ -366,6 +535,9 @@ private:
     ITfContext* compositionContext_;
     std::string compositionText_;
     ITfComposition* composition_ = nullptr;
+    ITfUIElementMgr* uiElementMgr_;
+    CandidateListUIElement* candidateElement_;
+    DWORD candidateUiElementId_;
 };
 
 HRESULT KeyEventSink::OnSetFocus(BOOL foreground) {
@@ -467,11 +639,28 @@ bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bo
 
 bool TextService::TestKey(ITfContext* context, WPARAM wParam, LPARAM lParam, bool& consume) {
     (void)context;
+    // Win+Space belongs to Windows' input-method switcher, not this TIP.
+    // Do not forward it to Node as a plain Space key or allow the TSF sink
+    // to consume it before the shell can advance to the next input method.
+    if (wParam == VK_SPACE &&
+        ((GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000))) {
+        consume = false;
+        NativeLog::Write("TestKey bypass Win+Space");
+        return true;
+    }
     std::string response;
     return CallCore("testKeyDown", wParam, lParam, consume, response);
 }
 
 bool TextService::HandleKey(ITfContext* context, WPARAM wParam, LPARAM lParam, bool& consume) {
+    // Win+Space belongs to Windows' input-method switcher. Keep it completely
+    // transparent to the IME so Windows can perform the profile transition.
+    if (wParam == VK_SPACE &&
+        ((GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000))) {
+        consume = false;
+        NativeLog::Write("HandleKey bypass Win+Space");
+        return true;
+    }
     std::string response;
     if (!CallCore("keyDown", wParam, lParam, consume, response)) return false;
     if (consume && context) return ApplyResponse(context, response);
@@ -483,8 +672,14 @@ bool TextService::ApplyResponse(ITfContext* context, const std::string& response
     const std::string commit = JsonString(response, "commit");
     const bool hasCommit = response.find("\"commit\":") != std::string::npos;
     const std::string text = hasCommit ? commit : composition;
+    const std::vector<std::string> candidates = JsonCandidateTexts(response);
+    const UINT selected = JsonUInt(response, "selectedCandidate", 0);
 
-    NativeLog::Write("ApplyResponse context=%p compositionBytes=%zu commit=%d", context, composition.size(), hasCommit ? 1 : 0);
+    NativeLog::Write("ApplyResponse context=%p compositionBytes=%zu commit=%d candidates=%zu selected=%u responseBytes=%zu",
+        context, composition.size(), hasCommit ? 1 : 0, candidates.size(), selected, response.size());
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        NativeLog::Write("ApplyResponse candidate[%zu]=%s", i, candidates[i].c_str());
+    }
     if (!context) return false;
     CompositionEditSession session(context, composition_, text, hasCommit);
     HRESULT sessionResult = E_FAIL;
@@ -495,6 +690,7 @@ bool TextService::ApplyResponse(ITfContext* context, const std::string& response
     if (FAILED(requestResult) || FAILED(sessionResult)) return false;
 
     if (hasCommit || composition.empty()) {
+        HideCandidates();
         compositionContext_ = nullptr;
         compositionText_.clear();
         if (composition_) {
@@ -505,8 +701,81 @@ bool TextService::ApplyResponse(ITfContext* context, const std::string& response
         if (!composition_) composition_ = session.DetachComposition();
         compositionContext_ = context;
         compositionText_ = composition;
+        if (!UpdateCandidates(context, response)) return false;
     }
     return true;
+}
+
+bool TextService::UpdateCandidates(ITfContext* context, const std::string& response) {
+    const std::vector<std::string> candidates = JsonCandidateTexts(response);
+    const UINT selection = JsonUInt(response, "selectedCandidate", 0);
+    NativeLog::Write("UpdateCandidates context=%p count=%zu selected=%u existing=%d",
+        context, candidates.size(), selection, candidateElement_ ? 1 : 0);
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        NativeLog::Write("UpdateCandidates candidate[%zu]=%s", i, candidates[i].c_str());
+    }
+    if (candidates.empty() || !context) {
+        NativeLog::Write("UpdateCandidates -> hide (empty=%d context=%d)", candidates.empty() ? 1 : 0, context ? 1 : 0);
+        HideCandidates();
+        return true;
+    }
+    if (!uiElementMgr_) {
+        if (!threadMgr_) return false;
+        const HRESULT hr = threadMgr_->QueryInterface(IID_ITfUIElementMgr, reinterpret_cast<void**>(&uiElementMgr_));
+        NativeLog::Hr("UpdateCandidates QueryInterface(ITfUIElementMgr)", hr);
+        if (FAILED(hr)) return false;
+    }
+
+    if (candidateElement_) {
+        candidateElement_->Update(candidates, selection);
+        candidateElement_->Show(TRUE);
+        NativeLog::Write("UpdateCandidates -> updating UI element id=%lu",
+            static_cast<unsigned long>(candidateUiElementId_));
+        const HRESULT hr = uiElementMgr_->UpdateUIElement(candidateUiElementId_);
+        NativeLog::Hr("UpdateCandidates UpdateUIElement", hr);
+        return SUCCEEDED(hr);
+    }
+
+    ITfDocumentMgr* documentMgr = nullptr;
+    HRESULT hr = context->GetDocumentMgr(&documentMgr);
+    if (FAILED(hr) || !documentMgr) {
+        NativeLog::Hr("UpdateCandidates GetDocumentMgr", FAILED(hr) ? hr : E_UNEXPECTED);
+        return false;
+    }
+    auto* element = new (std::nothrow) CandidateListUIElement(documentMgr, candidates, selection);
+    documentMgr->Release();
+    if (!element) return false;
+
+    BOOL show = TRUE;
+    DWORD elementId = 0;
+    hr = uiElementMgr_->BeginUIElement(static_cast<ITfUIElement*>(element), &show, &elementId);
+    NativeLog::Hr("UpdateCandidates BeginUIElement", hr);
+    if (FAILED(hr)) {
+        element->Release();
+        return false;
+    }
+    element->Show(show ? TRUE : FALSE);
+    candidateElement_ = element;
+    candidateUiElementId_ = elementId;
+    NativeLog::Write("UpdateCandidates -> created UI element id=%lu show=%d",
+        static_cast<unsigned long>(elementId), show ? 1 : 0);
+    hr = uiElementMgr_->UpdateUIElement(candidateUiElementId_);
+    NativeLog::Hr("UpdateCandidates initial UpdateUIElement", hr);
+    return SUCCEEDED(hr);
+}
+
+void TextService::HideCandidates() {
+    if (candidateElement_) {
+        NativeLog::Write("HideCandidates id=%lu", static_cast<unsigned long>(candidateUiElementId_));
+        candidateElement_->Show(FALSE);
+        if (uiElementMgr_ && candidateUiElementId_ != 0) {
+            const HRESULT hr = uiElementMgr_->EndUIElement(candidateUiElementId_);
+            NativeLog::Hr("HideCandidates EndUIElement", hr);
+        }
+        candidateElement_->Release();
+        candidateElement_ = nullptr;
+        candidateUiElementId_ = 0;
+    }
 }
 
 HRESULT KeyEventSink::OnTestKeyDown(ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
@@ -604,7 +873,7 @@ HRESULT RegisterTipProfile() {
         for (const LANGID langid : languages) {
             hr = profiles->AddLanguageProfile(CLSID_TypeScriptWindowsIme, langid,
                 GUID_TypeScriptWindowsImeProfile, kTypeScriptWindowsImeName,
-                static_cast<ULONG>(-1), nullptr, 0, 0);
+                static_cast<ULONG>(wcslen(kTypeScriptWindowsImeName)), nullptr, 0, 0);
             NativeLog::Write("AddLanguageProfile langid=0x%04X hr=0x%08lX", langid, static_cast<unsigned long>(hr));
             if (FAILED(hr)) break;
         }
