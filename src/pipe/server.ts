@@ -23,6 +23,8 @@ function handleMessage(message: RequestMessage, engine: SimpleEngine, state: Ime
         composition: message.composition,
         candidates: getCandidates(message.composition),
       }, state };
+    case "testKeyDown":
+      return { response: { id: message.id, consume: engine.testKey(message, state).consume }, state };
     case "reset": return { response: { id: message.id, consume: false, composition: "" }, state: initialImeState() };
     case "keyDown":
     case "keyUp":

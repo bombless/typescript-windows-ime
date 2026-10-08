@@ -2,6 +2,7 @@
   "name": "typescript-windows-ime",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "description": "Windows TSF IME with a thin native adapter and a TypeScript logic core.",
   "main": "dist/index.js",
   "scripts": {

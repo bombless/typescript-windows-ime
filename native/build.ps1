@@ -60,6 +60,27 @@ try {
     cl.exe /nologo /std:c++17 /EHsc /W4 /c PipeBridge.cpp /Fo:"$out\PipeBridge.obj"
     cl.exe /nologo /std:c++17 /EHsc /W4 PipeBridgeSmoke.cpp "$out\PipeBridge.obj" /Fe:"$out\PipeBridgeSmoke.exe"
     cl.exe /nologo /std:c++17 /EHsc /W4 PipeBridgeTest.cpp "$out\PipeBridge.obj" /Fe:"$out\PipeBridgeTest.exe"
-    cl.exe /nologo /std:c++17 /EHsc /W4 /LD TsIme.cpp /link /OUT:"$out\TypeScriptWindowsIme.dll" /IMPLIB:"$out\TypeScriptWindowsIme.lib" /DEF:"TsIme.def" /SUBSYSTEM:WINDOWS advapi32.lib ole32.lib
+
+    $dll = Join-Path $out "TypeScriptWindowsIme.dll"
+    $staging = Join-Path $out "staging"
+    $stagedDll = Join-Path $staging "TypeScriptWindowsIme.dll"
+    $stagedLib = Join-Path $staging "TypeScriptWindowsIme.lib"
+    $stagedExp = Join-Path $staging "TypeScriptWindowsIme.exp"
+
+    New-Item -ItemType Directory -Force -Path $staging | Out-Null
+    Remove-Item $stagedDll, $stagedLib, $stagedExp -Force -ErrorAction SilentlyContinue
+    cl.exe /nologo /std:c++17 /EHsc /W4 /LD TsIme.cpp "$out\PipeBridge.obj" /link /OUT:"$stagedDll" /IMPLIB:"$stagedLib" /DEF:"TsIme.def" /SUBSYSTEM:WINDOWS advapi32.lib ole32.lib user32.lib
+    if ($LASTEXITCODE -ne 0) { throw "Failed to link TypeScriptWindowsIme.dll." }
+
+    try {
+        Remove-Item $dll -Force -ErrorAction Stop
+    } catch {
+        Remove-Item $stagedDll, $stagedLib, $stagedExp -Force -ErrorAction SilentlyContinue
+        throw "Cannot replace $dll. The existing DLL is probably loaded by a TSF host. Disable the TypeScript Windows IME or restart the affected application, then run build.ps1 again. Original error: $($_.Exception.Message)"
+    }
+
+    Move-Item $stagedDll $dll -Force
+    Move-Item $stagedLib (Join-Path $out "TypeScriptWindowsIme.lib") -Force
+    if (Test-Path $stagedExp) { Move-Item $stagedExp (Join-Path $out "TypeScriptWindowsIme.exp") -Force }
 }
 finally { Pop-Location }

@@ -14,7 +14,7 @@ function normalizeCode(value: string): string {
 }
 
 function toUserText(value: string): string {
-  return toSimplified(value).replaceAll("妳", "你");
+  return String(toSimplified(value)).replaceAll("妳", "你");
 }
 
 function loadDictionary(): Map<string, Entry[]> {
@@ -27,7 +27,7 @@ function loadDictionary(): Map<string, Entry[]> {
       if (line.trim() === "...") { inTable = true; continue; }
       if (!inTable || !line || line.startsWith("#")) continue;
       const columns = line.split("\t");
-      const text = columns[0].trim();
+      const text = columns[0]?.trim() ?? "";
       if (!text) continue;
       let code = normalizeCode(columns[1]?.trim() ?? "");
       if (!/^[a-z]+$/.test(code)) continue;
@@ -66,28 +66,35 @@ export function getCandidates(composition: string): Candidate[] {
   combinations[0] = [{ text: "", weight: 0 }];
   const dictionaryEntries = getDictionary();
   for (let offset = 0; offset < query.length; offset++) {
-    if (combinations[offset].length === 0) continue;
+    const current = combinations[offset];
+    if (!current || current.length === 0) continue;
     for (const [code, entries] of dictionaryEntries) {
       if (!query.startsWith(code, offset)) continue;
       const next = offset + code.length;
       const topEntries = entries.slice(0, 4);
-      for (const prefix of combinations[offset]) {
+      const target = combinations[next];
+      if (!target) continue;
+      for (const prefix of current) {
         for (const entry of topEntries) {
-          combinations[next].push({ text: prefix.text + entry.text, weight: prefix.weight + entry.weight - 100 });
+          target.push({ text: prefix.text + entry.text, weight: prefix.weight + entry.weight - 100 });
         }
       }
-      combinations[next].sort((a, b) => b.weight - a.weight);
-      combinations[next] = combinations[next].slice(0, 24);
+      target.sort((a, b) => b.weight - a.weight);
+      combinations[next] = target.slice(0, 24);
     }
   }
-  const composed = combinations[query.length];
+  const composed = combinations[query.length] ?? [];
   const results = composed.length > 0 ? composed : [...getDictionary().entries()]
     .filter(([code]) => code.startsWith(query))
     .sort((a, b) => (b[1][0]?.weight ?? 0) - (a[1][0]?.weight ?? 0))
     .flatMap(([, list]) => list);
   const seen = new Set<string>();
-  return results.map((entry) => ({ ...entry, text: toUserText(entry.text) }))
+  return results.map((entry) => {
+    const text = toUserText(entry.text);
+    if ("code" in entry) return { text, index: 0, annotation: String(entry.code) };
+    return { text, index: 0 };
+  })
     .filter((entry) => !seen.has(entry.text) && (seen.add(entry.text), true))
     .slice(0, MAX_CANDIDATES)
-    .map((entry, index) => ({ text: entry.text, index, ...("code" in entry ? { annotation: entry.code } : {}) }));
+    .map((entry, index) => ({ ...entry, index }));
 }

@@ -19,6 +19,15 @@ describe("initial key behavior", () => {
     expect(reduceKey({ composition: "abc" }, { id: 5, type: "keyDown", vk: 27, scanCode: 1, key: "Escape", modifiers: 0 }))
       .toEqual({ state: { composition: "" }, consume: true });
   });
+  it("tests consumption without mutating the core state", async () => {
+    const { SimpleEngine } = await import("../src/ime/engine.js");
+    const engine = new SimpleEngine();
+    const state = { composition: "" };
+    expect(engine.testKey({ id: 20, type: "keyDown", vk: 65, scanCode: 30, key: "A", modifiers: 0 }, state))
+      .toEqual({ consume: true });
+    expect(state).toEqual({ composition: "" });
+  });
+
   it("does not consume unrelated keys or keyUp", () => {
     const state = { composition: "a" };
     expect(reduceKey(state, { id: 6, type: "keyDown", vk: 37, scanCode: 75, key: "ArrowLeft", modifiers: 0 }))
