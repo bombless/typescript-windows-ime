@@ -17,8 +17,9 @@ export function encodeMessage(message: RequestMessage | ResponseMessage): string
 
 export function decodeRequestLine(line: string): RequestMessage {
   if (byteLength(line) > MAX_MESSAGE_BYTES) throw new ProtocolError("Message exceeds maximum size", "MESSAGE_TOO_LARGE");
+  const text = line.replace(/^\uFEFF/, "").replace(/[\r\n]+$/u, "");
   let value: unknown;
-  try { value = JSON.parse(line); } catch { throw new ProtocolError("Malformed JSON", "INVALID_JSON"); }
+  try { value = JSON.parse(text); } catch { throw new ProtocolError("Malformed JSON", "INVALID_JSON"); }
   if (!isRequestMessage(value)) throw new ProtocolError("Invalid protocol message", "INVALID_MESSAGE");
   return value;
 }

@@ -7,8 +7,8 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     exit $LASTEXITCODE
 }
 
-$dll = Join-Path $PSScriptRoot "build\TypeScriptWindowsIme.dll"
-if (-not (Test-Path $dll)) { throw "Build the native DLL first: .\build.ps1" }
+$dll = Join-Path $PSScriptRoot "install\TypeScriptWindowsIme-current.dll"
+if (-not (Test-Path $dll)) { throw "Installed native DLL not found: $dll" }
 
 $regsvr32 = Join-Path $env:WINDIR "System32\regsvr32.exe"
 $process = Start-Process -FilePath $regsvr32 -ArgumentList @('/u', '/s', $dll) -Wait -PassThru

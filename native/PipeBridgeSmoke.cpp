@@ -2,12 +2,18 @@
 
 #include <iostream>
 #include <string>
+#include <thread>
 
 int main() {
     constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\TypeScriptWindowsIME";
     PipeBridge bridge(1000);
-    if (!bridge.Connect(kPipeName)) {
-        std::cerr << "PipeBridge: connect failed; start npm run dev first.\n";
+    bool connected = false;
+    for (int attempt = 0; attempt < 40 && !connected; ++attempt) {
+        connected = bridge.Connect(kPipeName);
+        if (!connected) Sleep(50);
+    }
+    if (!connected) {
+        std::cerr << "PipeBridge: TypeScript client did not connect.\n";
         return 2;
     }
     std::string response;

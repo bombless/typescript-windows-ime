@@ -6,7 +6,7 @@ See [PLAN.md](./PLAN.md) for the implementation plan and architecture.
 
 ## Architecture
 
-Windows TSF → C++ native adapter → Named Pipe → Node.js/TypeScript IME core
+Windows TSF → C++ native adapter / Named Pipe server → Node.js/TypeScript IME client
 
 The first milestone is a reliable end-to-end key event round trip. Business logic stays in TypeScript; C++ is limited to Windows TSF/COM, composition, and IPC glue.
 
@@ -21,8 +21,15 @@ npm run build
 npm run dev
 ```
 
-The initial protocol uses UTF-8 JSON Lines over the Windows Named Pipe:
-`\\.\pipe\TypeScriptWindowsIME`.
+The IPC uses UTF-8 JSON Lines over two Windows Named Pipes. Start
+`native\build\TypeScriptWindowsImeHost.exe` separately; Node connects to
+`\\.\pipe\TypeScriptWindowsIME.Host`, while the TSF DLL connects to
+`\\.\pipe\TypeScriptWindowsIME.Tsf`.
+
+The native Host owns both Named Pipe servers and remains online independently
+of TSF activation. The TypeScript process and TSF DLL connect as clients.
+
+Native DLLs are split into build and install locations: `native\\build\\TypeScriptWindowsIme.dll` is produced by `build.ps1`, while `native\\install\\TypeScriptWindowsIme-current.dll` is the copy registered with Windows. `build.ps1` never touches the installed copy. If an older COM registration or TSF host still has the old DLL loaded, run `native\\cleanup-com.ps1` from an elevated PowerShell to unregister the project CLSID, stop common TSF hosts, and restart `ctfmon` before rebuilding.
 
 Phase 0/1 deliberately keeps behavior small: alphabetic `keyDown` events produce a lowercase composition; the native adapter remains responsible for Windows TSF/COM concerns.
 

@@ -1,6 +1,7 @@
 #define INITGUID
 #include "TsIme.h"
 #include "PipeBridge.h"
+#include "NativeLog.h"
 
 #include <new>
 #include <string>
@@ -12,7 +13,7 @@ HRESULT RunComRegistration(bool unregister);
 
 volatile LONG g_serverLocks = 0;
 volatile LONG g_objectCount = 0;
-constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\TypeScriptWindowsIME";
+constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf";
 
 std::string JsonEscape(const std::string& value) {
     std::string out;
@@ -222,7 +223,7 @@ public:
         if (!count) delete this;
         return count;
     }
-    HRESULT STDMETHODCALLTYPE OnSetFocus(BOOL) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnSetFocus(BOOL foreground) override;
     HRESULT STDMETHODCALLTYPE OnTestKeyDown(ITfContext*, WPARAM, LPARAM, BOOL*) override;
     HRESULT STDMETHODCALLTYPE OnTestKeyUp(ITfContext*, WPARAM, LPARAM, BOOL*) override;
     HRESULT STDMETHODCALLTYPE OnKeyDown(ITfContext*, WPARAM, LPARAM, BOOL*) override;
@@ -237,7 +238,7 @@ class TextService final : public ITfTextInputProcessor {
 public:
     TextService()
         : refCount_(1), threadMgr_(nullptr), keyMgr_(nullptr), keySink_(nullptr),
-          clientId_(TF_CLIENTID_NULL), nextRequestId_(1), pipe_(250), compositionContext_(nullptr),
+          clientId_(TF_CLIENTID_NULL), keySinkAdvised_(false), nextRequestId_(1), pipe_(250), compositionContext_(nullptr),
           compositionText_() {
         InterlockedIncrement(&g_objectCount);
     }
@@ -267,7 +268,12 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE Activate(ITfThreadMgr* threadMgr, TfClientId clientId) override {
-        if (!threadMgr) return E_INVALIDARG;
+        NativeLog::Write("TextService::Activate enter this=%p threadMgr=%p clientId=%lu", this, threadMgr,
+            static_cast<unsigned long>(clientId));
+        if (!threadMgr) {
+            NativeLog::Hr("TextService::Activate invalid threadMgr", E_INVALIDARG);
+            return E_INVALIDARG;
+        }
         Deactivate();
 
         threadMgr_ = threadMgr;
@@ -275,6 +281,7 @@ public:
         clientId_ = clientId;
 
         HRESULT hr = threadMgr_->QueryInterface(IID_ITfKeystrokeMgr, reinterpret_cast<void**>(&keyMgr_));
+        NativeLog::Hr("TextService::Activate QueryInterface(ITfKeystrokeMgr)", hr);
         if (FAILED(hr)) {
             Deactivate();
             return hr;
@@ -287,23 +294,31 @@ public:
         }
 
         hr = keyMgr_->AdviseKeyEventSink(clientId_, keySink_, TRUE);
-        if (FAILED(hr)) {
-            hr = keyMgr_->AdviseKeyEventSink(clientId_, keySink_, FALSE);
-        }
-        if (FAILED(hr)) {
-            keySink_->Release();
-            keySink_ = nullptr;
-            Deactivate();
-            return hr;
-        }
+        if (SUCCEEDED(hr)) keySinkAdvised_ = true;
+        NativeLog::Write("TextService::Activate AdviseKeyEventSink clientId=%lu hr=0x%08lX advised=%d",
+            static_cast<unsigned long>(clientId_), static_cast<unsigned long>(hr), keySinkAdvised_ ? 1 : 0);
+
+        // The pipe server belongs to the activated TSF instance, not to an
+        // individual key event. Start accepting Node clients immediately so
+        // Node can connect as soon as the IME is active.
+        // IPC is optional during activation. TSF activation must remain fast
+        // even when the Node/host process is not running yet; key handling
+        // will use the short reconnect path below.
+        const bool pipeConnected = pipe_.ConnectToServer(kPipeName, 250);
+        NativeLog::Write("TextService::Activate pipe connect=%d", pipeConnected ? 1 : 0);
+        NativeLog::Write("TextService::Activate success this=%p", this);
 
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE Deactivate() override {
-        if (keyMgr_ && keySink_ && clientId_ != TF_CLIENTID_NULL) {
-            keyMgr_->UnadviseKeyEventSink(clientId_);
+        NativeLog::Write("TextService::Deactivate enter this=%p clientId=%lu advised=%d", this,
+            static_cast<unsigned long>(clientId_), keySinkAdvised_ ? 1 : 0);
+        if (keyMgr_ && keySink_ && keySinkAdvised_ && clientId_ != TF_CLIENTID_NULL) {
+            const HRESULT hr = keyMgr_->UnadviseKeyEventSink(clientId_);
+            NativeLog::Hr("TextService::Deactivate UnadviseKeyEventSink", hr);
         }
+        keySinkAdvised_ = false;
         if (keySink_) {
             keySink_->Release();
             keySink_ = nullptr;
@@ -324,11 +339,13 @@ public:
             composition_ = nullptr;
         }
         compositionText_.clear();
+        NativeLog::Write("TextService::Deactivate complete this=%p", this);
         return S_OK;
     }
 
     bool TestKey(ITfContext*, WPARAM wParam, LPARAM, bool& consume);
     bool HandleKey(ITfContext* context, WPARAM wParam, LPARAM, bool& consume);
+    void LogActiveProfile(const char* where) const;
 
 private:
     static std::string KeyName(WPARAM vk);
@@ -343,12 +360,19 @@ private:
     ITfKeystrokeMgr* keyMgr_;
     KeyEventSink* keySink_;
     TfClientId clientId_;
+    bool keySinkAdvised_;
     unsigned int nextRequestId_;
     PipeBridge pipe_;
     ITfContext* compositionContext_;
     std::string compositionText_;
     ITfComposition* composition_ = nullptr;
 };
+
+HRESULT KeyEventSink::OnSetFocus(BOOL foreground) {
+    NativeLog::Write("OnSetFocus service=%p foreground=%d", service_, foreground ? 1 : 0);
+    service_->LogActiveProfile(foreground ? "OnSetFocus-foreground" : "OnSetFocus-background");
+    return S_OK;
+}
 
 HRESULT KeyEventSink::QueryInterface(REFIID riid, void** object) {
     if (!object) return E_POINTER;
@@ -374,6 +398,29 @@ std::string TextService::KeyName(WPARAM vk) {
     }
 }
 
+void TextService::LogActiveProfile(const char* where) const {
+    if (!threadMgr_) {
+        NativeLog::Write("ActiveProfile where=%s threadMgr=null", where);
+        return;
+    }
+    ITfInputProcessorProfileMgr* profileMgr = nullptr;
+    HRESULT hr = threadMgr_->QueryInterface(IID_ITfInputProcessorProfileMgr,
+        reinterpret_cast<void**>(&profileMgr));
+    if (FAILED(hr)) {
+        NativeLog::Write("ActiveProfile where=%s QueryInterface hr=0x%08lX", where, static_cast<unsigned long>(hr));
+        return;
+    }
+    TF_INPUTPROCESSORPROFILE profile{};
+    hr = profileMgr->GetActiveProfile(GUID_TFCAT_TIP_KEYBOARD, &profile);
+    if (SUCCEEDED(hr)) {
+        NativeLog::Write("ActiveProfile where=%s lang=0x%04X clsid=%08lX-%04X-%04X profile=%08lX-%04X-%04X active=%d",
+            where, profile.langid, profile.clsid.Data1, profile.clsid.Data2, profile.clsid.Data3,
+            profile.guidProfile.Data1, profile.guidProfile.Data2, profile.guidProfile.Data3);
+    } else {
+        NativeLog::Write("ActiveProfile where=%s GetActiveProfile hr=0x%08lX", where, static_cast<unsigned long>(hr));
+    }
+    profileMgr->Release();
+}
 int TextService::Modifiers() {
     int modifiers = 0;
     if (GetKeyState(VK_SHIFT) & 0x8000) modifiers |= 1;
@@ -386,9 +433,13 @@ bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bo
                            std::string& response) {
     consume = false;
     const std::string key = KeyName(vk);
-    if (key.empty()) return true;
+    if (key.empty()) {
+        NativeLog::Write("CallCore type=%s ignored vk=0x%02X", type.c_str(), static_cast<unsigned int>(vk));
+        return true;
+    }
 
-    if (!pipe_.IsConnected() && !pipe_.Connect(kPipeName)) {
+    if (!pipe_.IsConnected() && !pipe_.ConnectToServer(kPipeName, 50)) {
+        NativeLog::Write("CallCore type=%s key=%s pipe unavailable", type.c_str(), key.c_str());
         return false;
     }
 
@@ -402,11 +453,15 @@ bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bo
         ",\"key\":\"" + JsonEscape(key) +
         "\",\"modifiers\":" + std::to_string(Modifiers()) + "}";
 
+    NativeLog::Write("CallCore request id=%u type=%s vk=0x%02X key=%s modifiers=%d",
+        id, type.c_str(), static_cast<unsigned int>(vk), key.c_str(), Modifiers());
     if (!pipe_.Call(request, response, id)) {
+        NativeLog::Write("CallCore response id=%u failed", id);
         pipe_.Disconnect();
         return false;
     }
     consume = JsonBool(response, "consume", false);
+    NativeLog::Write("CallCore response id=%u consume=%d bytes=%zu", id, consume ? 1 : 0, response.size());
     return true;
 }
 
@@ -429,11 +484,14 @@ bool TextService::ApplyResponse(ITfContext* context, const std::string& response
     const bool hasCommit = response.find("\"commit\":") != std::string::npos;
     const std::string text = hasCommit ? commit : composition;
 
+    NativeLog::Write("ApplyResponse context=%p compositionBytes=%zu commit=%d", context, composition.size(), hasCommit ? 1 : 0);
     if (!context) return false;
     CompositionEditSession session(context, composition_, text, hasCommit);
     HRESULT sessionResult = E_FAIL;
     const HRESULT requestResult = context->RequestEditSession(
         clientId_, &session, TF_ES_SYNC | TF_ES_READWRITE, &sessionResult);
+    NativeLog::Write("ApplyResponse RequestEditSession request=0x%08lX session=0x%08lX",
+        static_cast<unsigned long>(requestResult), static_cast<unsigned long>(sessionResult));
     if (FAILED(requestResult) || FAILED(sessionResult)) return false;
 
     if (hasCommit || composition.empty()) {
@@ -456,6 +514,8 @@ HRESULT KeyEventSink::OnTestKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     bool consume = false;
     const bool ok = service_->TestKey(context, wParam, lParam, consume);
     *eaten = ok && consume ? TRUE : FALSE;
+    NativeLog::Write("OnTestKeyDown context=%p vk=0x%02X ok=%d consume=%d eaten=%d",
+        context, static_cast<unsigned int>(wParam), ok ? 1 : 0, consume ? 1 : 0, *eaten ? 1 : 0);
     return S_OK;
 }
 
@@ -470,6 +530,8 @@ HRESULT KeyEventSink::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM lPara
     bool consume = false;
     const bool ok = service_->HandleKey(context, wParam, lParam, consume);
     *eaten = ok && consume ? TRUE : FALSE;
+    NativeLog::Write("OnKeyDown context=%p vk=0x%02X ok=%d consume=%d eaten=%d",
+        context, static_cast<unsigned int>(wParam), ok ? 1 : 0, consume ? 1 : 0, *eaten ? 1 : 0);
     return S_OK;
 }
 
@@ -524,21 +586,26 @@ private:
 HRESULT CreateProfiles(ITfInputProcessorProfiles** profiles) {
     if (!profiles) return E_POINTER;
     *profiles = nullptr;
-    return CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
+    const HRESULT hr = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
         IID_ITfInputProcessorProfiles, reinterpret_cast<void**>(profiles));
+    NativeLog::Hr("CreateProfiles", hr);
+    return hr;
 }
 
 HRESULT RegisterTipProfile() {
+    NativeLog::Write("RegisterTipProfile begin");
     ITfInputProcessorProfiles* profiles = nullptr;
     HRESULT hr = CreateProfiles(&profiles);
     if (FAILED(hr)) return hr;
     hr = profiles->Register(CLSID_TypeScriptWindowsIme);
+    NativeLog::Hr("ITfInputProcessorProfiles::Register", hr);
     if (SUCCEEDED(hr)) {
         const LANGID languages[] = { 0x0409, 0x0804, 0x0411 };
         for (const LANGID langid : languages) {
             hr = profiles->AddLanguageProfile(CLSID_TypeScriptWindowsIme, langid,
                 GUID_TypeScriptWindowsImeProfile, kTypeScriptWindowsImeName,
                 static_cast<ULONG>(-1), nullptr, 0, 0);
+            NativeLog::Write("AddLanguageProfile langid=0x%04X hr=0x%08lX", langid, static_cast<unsigned long>(hr));
             if (FAILED(hr)) break;
         }
     }
@@ -546,21 +613,26 @@ HRESULT RegisterTipProfile() {
         ITfCategoryMgr* categoryMgr = nullptr;
         hr = CoCreateInstance(CLSID_TF_CategoryMgr, nullptr, CLSCTX_INPROC_SERVER,
             IID_ITfCategoryMgr, reinterpret_cast<void**>(&categoryMgr));
+        NativeLog::Hr("Create ITfCategoryMgr", hr);
         if (SUCCEEDED(hr)) {
             hr = categoryMgr->RegisterCategory(CLSID_TypeScriptWindowsIme,
                 GUID_TFCAT_TIP_KEYBOARD, CLSID_TypeScriptWindowsIme);
+            NativeLog::Hr("ITfCategoryMgr::RegisterCategory", hr);
             categoryMgr->Release();
         }
     }
     profiles->Release();
+    NativeLog::Hr("RegisterTipProfile result", hr);
     return hr;
 }
 
 HRESULT UnregisterTipProfile() {
+    NativeLog::Write("UnregisterTipProfile begin");
     ITfInputProcessorProfiles* profiles = nullptr;
     HRESULT hr = CreateProfiles(&profiles);
     if (FAILED(hr)) return hr;
     hr = profiles->Unregister(CLSID_TypeScriptWindowsIme);
+    NativeLog::Hr("ITfInputProcessorProfiles::Unregister", hr);
     profiles->Release();
     return hr;
 }
@@ -609,7 +681,9 @@ HRESULT UnregisterComServer() {
 }
 
 HRESULT RunComRegistration(bool unregister) {
+    NativeLog::Write("RunComRegistration begin unregister=%d", unregister ? 1 : 0);
     HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    NativeLog::Hr("CoInitializeEx", init);
     const bool shouldUninitialize = SUCCEEDED(init);
     if (FAILED(init) && init != RPC_E_CHANGED_MODE) return init;
 
@@ -617,11 +691,13 @@ HRESULT RunComRegistration(bool unregister) {
     if (SUCCEEDED(hr)) hr = unregister ? UnregisterComServer() : RegisterTipProfile();
     if (!unregister && FAILED(hr)) UnregisterComServer();
     if (shouldUninitialize) CoUninitialize();
+    NativeLog::Hr("RunComRegistration result", hr);
     return hr;
 }
 }
 
 STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, LPVOID* object) {
+    NativeLog::Write("DllGetClassObject clsidMatch=%d object=%p", clsid == CLSID_TypeScriptWindowsIme ? 1 : 0, object);
     if (clsid != CLSID_TypeScriptWindowsIme) return CLASS_E_CLASSNOTAVAILABLE;
     auto* factory = new (std::nothrow) ClassFactory();
     if (!factory) return E_OUTOFMEMORY;

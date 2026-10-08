@@ -38,15 +38,27 @@ if (-not $cl) {
         throw "VS2022 with the C++ x64 toolchain was not found. Install Microsoft.VisualStudio.Component.VC.Tools.x86.x64 or run this script from a Visual Studio Developer PowerShell."
     }
 
-    $envDump = & cmd.exe /d /s /c "call `"$vsDevCmd`" -arch=x64 -host_arch=x64 >nul && set"
+    # Capture the developer environment after VsDevCmd returns.
+    $envDump = & cmd.exe /d /s /c "call `"$vsDevCmd`" -arch=x64 -host_arch=x64 && set"
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to initialize the Visual Studio developer environment from $vsDevCmd."
     }
 
+    $capturedEnvironment = @{}
     foreach ($line in $envDump) {
         if ($line -match "^([^=]+)=(.*)$") {
-            [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+            $capturedEnvironment[$matches[1].ToUpperInvariant()] = [pscustomobject]@{
+                Name = $matches[1]
+                Value = $matches[2]
+            }
         }
+    }
+    foreach ($entry in $capturedEnvironment.Values | Where-Object { $_.Name -ine 'PATH' }) {
+        [Environment]::SetEnvironmentVariable($entry.Name, $entry.Value, "Process")
+    }
+    $pathLine = $envDump | Where-Object { $_ -cmatch '^PATH=' } | Select-Object -First 1
+    if ($pathLine -match '^PATH=(.*)$') {
+        [Environment]::SetEnvironmentVariable('Path', $matches[1], 'Process')
     }
 
     $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
@@ -60,7 +72,11 @@ try {
     cl.exe /nologo /std:c++17 /EHsc /W4 /c PipeBridge.cpp /Fo:"$out\PipeBridge.obj"
     cl.exe /nologo /std:c++17 /EHsc /W4 PipeBridgeSmoke.cpp "$out\PipeBridge.obj" /Fe:"$out\PipeBridgeSmoke.exe"
     cl.exe /nologo /std:c++17 /EHsc /W4 PipeBridgeTest.cpp "$out\PipeBridge.obj" /Fe:"$out\PipeBridgeTest.exe"
+    cl.exe /nologo /std:c++17 /EHsc /W4 TypeScriptWindowsImeHost.cpp /Fe:"$out\TypeScriptWindowsImeHost.exe"
+    cl.exe /nologo /std:c++17 /EHsc /W4 TsfDiagnose.cpp /Fe:"$out\TsfDiagnose.exe" ole32.lib advapi32.lib
 
+    # Build artifacts stay under native\\build. The installable DLL is copied
+    # into native\\install by the installer and is never touched by this script.
     $dll = Join-Path $out "TypeScriptWindowsIme.dll"
     $staging = Join-Path $out "staging"
     $stagedDll = Join-Path $staging "TypeScriptWindowsIme.dll"

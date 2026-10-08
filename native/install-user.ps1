@@ -1,54 +1,73 @@
 $ErrorActionPreference = "Stop"
 
-$finalDll = Join-Path $PSScriptRoot "build\TypeScriptWindowsIme.dll"
-$activeDll = Join-Path $PSScriptRoot "build\TypeScriptWindowsIme.Active.dll"
-$dll = if (Test-Path $activeDll) { $activeDll } else { $finalDll }
+$buildDll = Join-Path $PSScriptRoot "build\TypeScriptWindowsIme.dll"
+$installDir = Join-Path $PSScriptRoot "install"
+$version = Get-Date -Format "yyyyMMdd-HHmmssfff"
+$dll = Join-Path $installDir "TypeScriptWindowsIme-$version.dll"
+if (-not (Test-Path $buildDll)) { throw "Native build DLL not found: $buildDll. Run .\build.ps1 first." }
+$principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "Administrator permission is required for TSF registration. Requesting elevation..."
+    $arguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath)
+    $elevatedShell = if (Test-Path (Join-Path $PSHOME "pwsh.exe")) { Join-Path $PSHOME "pwsh.exe" } else { "powershell.exe" }
+    $child = Start-Process -FilePath $elevatedShell -ArgumentList $arguments -Verb RunAs -Wait -PassThru
+    if ($child.ExitCode -ne 0) {
+        throw "Elevated TSF registration failed with exit code $($child.ExitCode). Open an Administrator PowerShell and run: & '$elevatedShell' -NoProfile -ExecutionPolicy Bypass -File '$PSCommandPath'"
+    }
+    exit 0
+}
+
+New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+
+# Never overwrite an installed DLL: TSF may still have an older version loaded.
+# A unique file lets the old module finish its current lifetime while the COM
+# registration switches atomically to the new build.
+Copy-Item -Force $buildDll $dll -ErrorAction Stop
+
+# DllRegisterServer performs the supported TSF registration calls: Register,
+# AddLanguageProfile, and RegisterCategory. Writing HKCU values alone does not
+# create a visible keyboard TIP.
+$regsvr32 = Join-Path $env:WINDIR "System32\regsvr32.exe"
+$process = Start-Process -FilePath $regsvr32 -ArgumentList @('/s', $dll) -Wait -PassThru
+if ($process.ExitCode -ne 0) { throw "64-bit regsvr32 failed with exit code $($process.ExitCode) for $dll." }
+
 $clsid = "{7B2E4F5A-3A8E-4D74-9F0B-6D5D6F0E6C41}"
 $profile = "{C0A3B5B1-3C52-4E8E-A8A7-1F2B3D4C5E60}"
-
-if (-not (Test-Path $dll)) {
-    throw "Native DLL not found: $dll. Run .\native\build.ps1 first."
+$reg = Join-Path $env:WINDIR "System32\reg.exe"
+# Ensure the 64-bit COM registration is present in the same view used by the
+# 64-bit TSF host. DllRegisterServer normally creates these values, but the
+# explicit write makes this script robust when registry redirection is active.
+$clsidKey = "HKLM\SOFTWARE\Classes\CLSID\$clsid"
+$inprocKey = "$clsidKey\InprocServer32"
+& $reg add $clsidKey /ve /t REG_SZ /d "TypeScript Windows IME" /f | Out-Null
+& $reg add $inprocKey /ve /t REG_SZ /d $dll /f | Out-Null
+& $reg add $inprocKey /v ThreadingModel /t REG_SZ /d Apartment /f | Out-Null
+$comQuery = & $reg query $inprocKey /ve 2>$null
+if ($LASTEXITCODE -ne 0 -or -not (($comQuery -join "`n") -like "*$dll*")) {
+    throw "64-bit COM registration verification failed. Expected: $dll"
 }
 
-# COM CLSID registration is WOW64-sensitive. Always write the 64-bit view
-# because TypeScriptWindowsIme.dll is built as x64.
-$reg = if ([IntPtr]::Size -eq 4) {
-    Join-Path $env:WINDIR "SysNative\reg.exe"
-} else {
-    Join-Path $env:WINDIR "System32\reg.exe"
+$profileKey = "HKLM\SOFTWARE\Microsoft\CTF\TIP\$clsid\LanguageProfile\0x00000804\$profile"
+& $reg query $profileKey 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "TSF registration verification failed. Language profile was not created: $profileKey" }
+& $reg add $profileKey /v Enable /t REG_DWORD /d 1 /f | Out-Null
+
+# Windows uses the per-user Enable flag when deciding whether a TIP can be
+# activated for the current language. Add it for every profile we register;
+# without this value the IME can appear in the list but fail to switch on.
+foreach ($langid in @("00000409", "00000804", "00000411")) {
+    $userProfileKey = "HKCU\Software\Microsoft\CTF\TIP\$clsid\LanguageProfile\0x$langid\$profile"
+    & $reg add $userProfileKey /v Enable /t REG_DWORD /d 1 /f | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Per-user TSF profile enable failed: $userProfileKey" }
 }
 
-$clsidPath = "HKCU\Software\Classes\CLSID\$clsid"
-$inprocPath = "$clsidPath\InprocServer32"
-
-& $reg add $clsidPath /ve /t REG_SZ /d "TypeScript Windows IME" /f | Out-Null
-& $reg add $inprocPath /ve /t REG_SZ /d $dll /f | Out-Null
-& $reg add $inprocPath /v ThreadingModel /t REG_SZ /d Apartment /f | Out-Null
-
-$registered = (& $reg query $inprocPath /v "(Default)" 2>$null | Select-String "REG_SZ").ToString()
-if ($registered -notlike "*$dll*") {
-    throw "64-bit per-user COM registration verification failed. Expected: $dll"
-}
-
-# Keep the current Chinese language profile enabled.
-$profilePath = "HKCU\Software\Microsoft\CTF\TIP\$clsid\LanguageProfile\0x00000804\$profile"
-& $reg add $profilePath /v Enable /t REG_DWORD /d 1 /f | Out-Null
-
-Write-Host "64-bit per-user COM registration verified:"
-Write-Host "  CLSID: $clsid"
-Write-Host "  DLL:   $dll"
-Write-Host "  Profile: zh-CN enabled"
-Write-Host ""
+Write-Host "64-bit TSF registration verified:"
+Write-Host "  CLSID:   $clsid"
+Write-Host "  DLL:     $dll"
+Write-Host "  Profile: zh-CN ($profile)"
 Write-Host "Restarting ctfmon..."
-$ctfmon = if ([IntPtr]::Size -eq 4) {
-    Join-Path $env:WINDIR "SysNative\ctfmon.exe"
-} else {
-    Join-Path $env:WINDIR "System32\ctfmon.exe"
-}
+$ctfmon = Join-Path $env:WINDIR "System32\ctfmon.exe"
+if (-not (Test-Path $ctfmon)) { throw "ctfmon.exe was not found at '$ctfmon'." }
 Get-Process ctfmon -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Process $ctfmon
-Write-Host ""
-Write-Host "Next:"
-Write-Host "  1. Restart the target application."
-Write-Host "  2. Select 'TypeScript Windows IME' in the Windows input switcher."
-Write-Host "  3. Type ni then Space; expected result: 你"
+Start-Process -FilePath $ctfmon
+Write-Host "Restart the target application and select 'TypeScript Windows IME'."

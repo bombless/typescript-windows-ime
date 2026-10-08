@@ -1,58 +1,78 @@
-import { createServer, type Server, type Socket } from "node:net";
+import { createServer, type Socket } from "node:net";
 import { PROTOCOL_VERSION, type RequestMessage, type ResponseMessage } from "../protocol/messages.js";
 import { encodeMessage, JsonlDecoder, ProtocolError } from "../protocol/codec.js";
 import { SimpleEngine } from "../ime/engine.js";
 import { getCandidates } from "../ime/candidates.js";
 import { initialImeState, type ImeState } from "../ime/state.js";
+import { appendFileSync } from "node:fs";
 
-export const PIPE_NAME = "\\\\.\\pipe\\TypeScriptWindowsIME";
+export const PIPE_NAME = "\\\\.\\pipe\\TypeScriptWindowsIME.Tsf";
 
-function handleMessage(message: RequestMessage, engine: SimpleEngine, state: ImeState): { response: ResponseMessage; state: ImeState } {
+const engine = new SimpleEngine();
+let state = initialImeState();
+
+function logPipe(direction: "← C++" | "→ C++", message: unknown): void {
+  const line = `[PIPE ${direction}] ${JSON.stringify(message)}`;
+  console.log(line);
+  try { appendFileSync("ts-pipe.log", line + "\n"); } catch {}
+}
+
+function handleMessage(message: RequestMessage): ResponseMessage {
   switch (message.type) {
     case "hello":
       return message.protocol === PROTOCOL_VERSION
-        ? { response: { id: message.id, consume: false }, state }
-        : { response: { id: message.id, consume: false, error: {
+        ? { id: message.id, consume: false }
+        : { id: message.id, consume: false, error: {
             code: "UNSUPPORTED_PROTOCOL",
             message: `Unsupported protocol version: ${message.protocol}`,
-          } }, state };
+          } };
     case "query":
-      return { response: {
+      return {
         id: message.id,
         consume: message.composition.length > 0,
         composition: message.composition,
         candidates: getCandidates(message.composition),
-      }, state };
+      };
     case "testKeyDown":
-      return { response: { id: message.id, consume: engine.testKey(message, state).consume }, state };
-    case "reset": return { response: { id: message.id, consume: false, composition: "" }, state: initialImeState() };
+      return { id: message.id, consume: engine.testKey(message, state).consume };
+    case "reset": state = initialImeState(); return { id: message.id, consume: false, composition: "" };
     case "keyDown":
-    case "keyUp":
-      return engine.processKey(message, state);
+    case "keyUp": {
+      const result = engine.processKey(message, state);
+      state = result.state;
+      return result.response;
+    }
   }
 }
 
 function handleConnection(socket: Socket): void {
   const decoder = new JsonlDecoder();
-  const engine = new SimpleEngine();
-  let state = initialImeState();
   socket.setNoDelay(true);
   socket.on("data", (chunk) => {
     try {
       for (const message of decoder.push(chunk)) {
-        const result = handleMessage(message, engine, state);
-        state = result.state;
-        socket.write(encodeMessage(result.response));
+        logPipe("← C++", message);
+        const response = handleMessage(message);
+        logPipe("→ C++", response);
+        socket.write(encodeMessage(response));
       }
     } catch (error) {
       const protocolError = error instanceof ProtocolError ? error : new ProtocolError("Protocol failure", "INVALID_MESSAGE");
-      socket.write(encodeMessage({ id: 0, consume: false, error: { code: protocolError.code, message: protocolError.message } }));
+      const response = { id: 0, consume: false, error: { code: protocolError.code, message: protocolError.message } };
+      logPipe("→ C++", response);
+      socket.write(encodeMessage(response));
     }
   });
+  socket.on("close", () => console.log("[PIPE] TSF client disconnected"));
 }
 
-export function startPipeServer(pipeName = PIPE_NAME): Server {
-  const server = createServer(handleConnection);
-  server.listen(pipeName);
-  return server;
+export function startPipeServer(pipeName = PIPE_NAME): { close(): Promise<void> } {
+  const server = createServer((socket) => handleConnection(socket));
+  server.on("error", (error) => console.log(`[PIPE] server error: ${error.message}`));
+  server.listen(pipeName, () => console.log(`[PIPE] TS listening on ${pipeName}`));
+  return {
+    close() {
+      return new Promise((resolve) => server.close(() => resolve()));
+    },
+  };
 }
