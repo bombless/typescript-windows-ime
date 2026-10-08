@@ -87,7 +87,6 @@ export function startPipeClient(pipeName = PIPE_NAME, callbacks: PipeClientCallb
     handleConnection(next);
     next.once("connect", () => {
       connected = true;
-      console.log(`[PIPE] connected to Host: ${pipeName}`);
       callbacks.onConnected?.();
     });
     next.once("error", (error) => {
