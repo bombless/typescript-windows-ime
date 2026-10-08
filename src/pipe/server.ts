@@ -76,11 +76,25 @@ function handleConnection(socket: Socket): void {
   socket.on("close", () => console.log("[PIPE] TSF client disconnected"));
 }
 
-export function startPipeServer(pipeName = PIPE_NAME): { close(): Promise<void> } {
+export interface PipeServer {
+  /** Resolves once the pipe is owned, rejects when another process keeps it. */
+  ready: Promise<void>;
+  close(): Promise<void>;
+}
+
+export function startPipeServer(pipeName = PIPE_NAME): PipeServer {
   const server = createServer((socket) => handleConnection(socket));
+  const ready = new Promise<void>((resolve, reject) => {
+    server.once("listening", () => {
+      console.log(`[PIPE] TS listening on ${pipeName}`);
+      resolve();
+    });
+    server.once("error", reject);
+  });
   server.on("error", (error) => console.log(`[PIPE] server error: ${error.message}`));
-  server.listen(pipeName, () => console.log(`[PIPE] TS listening on ${pipeName}`));
+  server.listen(pipeName);
   return {
+    ready,
     close() {
       return new Promise((resolve) => server.close(() => resolve()));
     },

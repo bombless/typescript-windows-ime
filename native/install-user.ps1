@@ -4,7 +4,39 @@ $buildDll = Join-Path $PSScriptRoot "build\TypeScriptWindowsIme.dll"
 $installDir = Join-Path $PSScriptRoot "install"
 $version = Get-Date -Format "yyyyMMdd-HHmmssfff"
 $dll = Join-Path $installDir "TypeScriptWindowsIme-$version.dll"
+$clsid = "{7B2E4F5A-3A8E-4D74-9F0B-6D5D6F0E6C41}"
+$profile = "{C0A3B5B1-3C52-4E8E-A8A7-1F2B3D4C5E60}"
 if (-not (Test-Path $buildDll)) { throw "Native build DLL not found: $buildDll. Run .\build.ps1 first." }
+
+# Windows loads the DLL the COM registration points at, so installing a build
+# older than the registered one silently rolls the IME back and the fixed code
+# never runs. Reject that before asking for elevation.
+$registeredKey = "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32"
+$registeredDll = $null
+if (Test-Path -LiteralPath $registeredKey) {
+    $registeredDll = (Get-ItemProperty -LiteralPath $registeredKey).'(default)'
+}
+$alreadyRegistered = $false
+if ($registeredDll -and (Test-Path -LiteralPath $registeredDll)) {
+    $build = Get-Item -LiteralPath $buildDll
+    $installed = Get-Item -LiteralPath $registeredDll
+    $buildHash = (Get-FileHash -LiteralPath $buildDll -Algorithm SHA256).Hash
+    $installedHash = (Get-FileHash -LiteralPath $registeredDll -Algorithm SHA256).Hash
+    if ($buildHash -eq $installedHash) {
+        $alreadyRegistered = $true
+    } elseif ($build.LastWriteTimeUtc -lt $installed.LastWriteTimeUtc) {
+        throw "Build DLL is older than the registered DLL. build='$($build.FullName)' $($build.LastWriteTime); registered='$registeredDll' $($installed.LastWriteTime). Run .\build.ps1 and try again."
+    } else {
+        Write-Host "Updating: build $($build.LastWriteTime) replaces registered $($installed.LastWriteTime)."
+    }
+}
+if ($alreadyRegistered) {
+    Write-Host "No update needed: the registered DLL already is this exact build."
+    Write-Host "  CLSID: $clsid"
+    Write-Host "  DLL:   $registeredDll"
+    Write-Host "Rebuild with .\build.ps1 first, or restart the target application if it still loads an older DLL."
+    exit 0
+}
 $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "Administrator permission is required for TSF registration. Requesting elevation..."
@@ -31,8 +63,6 @@ $regsvr32 = Join-Path $env:WINDIR "System32\regsvr32.exe"
 $process = Start-Process -FilePath $regsvr32 -ArgumentList @('/s', $dll) -Wait -PassThru
 if ($process.ExitCode -ne 0) { throw "64-bit regsvr32 failed with exit code $($process.ExitCode) for $dll." }
 
-$clsid = "{7B2E4F5A-3A8E-4D74-9F0B-6D5D6F0E6C41}"
-$profile = "{C0A3B5B1-3C52-4E8E-A8A7-1F2B3D4C5E60}"
 $reg = Join-Path $env:WINDIR "System32\reg.exe"
 # Ensure the 64-bit COM registration is present in the same view used by the
 # 64-bit TSF host. DllRegisterServer normally creates these values, but the
@@ -61,7 +91,7 @@ foreach ($langid in @("00000409", "00000804", "00000411")) {
     if ($LASTEXITCODE -ne 0) { throw "Per-user TSF profile enable failed: $userProfileKey" }
 }
 
-Write-Host "64-bit TSF registration verified:"
+Write-Host "Installed and verified:"
 Write-Host "  CLSID:   $clsid"
 Write-Host "  DLL:     $dll"
 Write-Host "  Profile: zh-CN ($profile)"

@@ -10,7 +10,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "tsx src/index.ts",
-    "host": "native\\build\\TypeScriptWindowsImeHost.exe",
+    "host": "powershell -NoProfile -ExecutionPolicy Bypass -File native\\install-host.ps1",
     "start": "node dist/index.js"
   },
   "engines": {

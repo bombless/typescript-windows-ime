@@ -1,5 +1,6 @@
 #define INITGUID
 #include "TsIme.h"
+#include "CandidateWindow.h"
 #include "PipeBridge.h"
 #include "NativeLog.h"
 
@@ -10,10 +11,17 @@
 namespace {
 HRESULT RunComRegistration(bool unregister);
 
+class TextService;
+
 
 volatile LONG g_serverLocks = 0;
 volatile LONG g_objectCount = 0;
 constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf";
+
+// The candidate window asks for the caret rectangle from a timer, so the
+// service that owns the current composition has to be reachable from there.
+TextService* g_activeService = nullptr;
+bool ReadCaretRectFromService(RECT& caret);
 
 std::string JsonEscape(const std::string& value) {
     std::string out;
@@ -127,23 +135,34 @@ std::vector<std::string> JsonCandidateTexts(const std::string& json) {
     return candidates;
 }
 
-constexpr GUID kCandidateListUiElementGuid =
-    { 0x9f5b4d21, 0x4b54, 0x4f4f, { 0x9a, 0x2a, 0x7f, 0x32, 0x9e, 0x91, 0x4b, 0x16 } };
+std::vector<std::wstring> WideCandidates(const std::vector<std::string>& candidates) {
+    std::vector<std::wstring> wide;
+    wide.reserve(candidates.size());
+    for (const std::string& candidate : candidates) wide.push_back(Utf8ToWide(candidate));
+    return wide;
+}
 
-class CandidateListUIElement final : public ITfCandidateListUIElementBehavior {
+class TextService;
+
+// Re-reads the caret rectangle of the live composition. Applications lay out
+// composition text after the edit session that inserted it, so the first
+// ITfContextView::GetTextExt call often reports nothing useful.
+class CaretProbeSession final : public ITfEditSession {
 public:
-    CandidateListUIElement(ITfDocumentMgr* documentMgr, std::vector<std::string> candidates, UINT selection)
-        : refCount_(1), documentMgr_(documentMgr), candidates_(std::move(candidates)), selection_(selection), shown_(TRUE) {
-        if (documentMgr_) documentMgr_->AddRef();
+    CaretProbeSession(ITfContext* context, ITfComposition* composition, RECT* caret)
+        : refCount_(1), context_(context), composition_(composition), caret_(caret), hr_(E_FAIL) {
+        if (context_) context_->AddRef();
+        if (composition_) composition_->AddRef();
     }
-    ~CandidateListUIElement() { if (documentMgr_) documentMgr_->Release(); }
-
+    ~CaretProbeSession() {
+        if (composition_) composition_->Release();
+        if (context_) context_->Release();
+    }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
         if (!object) return E_POINTER;
         *object = nullptr;
-        if (riid == IID_IUnknown || riid == IID_ITfUIElement || riid == IID_ITfCandidateListUIElement ||
-            riid == IID_ITfCandidateListUIElementBehavior) {
-            *object = static_cast<ITfCandidateListUIElementBehavior*>(this);
+        if (riid == IID_IUnknown || riid == IID_ITfEditSession) {
+            *object = static_cast<ITfEditSession*>(this);
             AddRef();
             return S_OK;
         }
@@ -155,95 +174,61 @@ public:
         if (!count) delete this;
         return count;
     }
-    HRESULT STDMETHODCALLTYPE GetDescription(BSTR* description) override {
-        if (!description) return E_POINTER;
-        *description = SysAllocString(L"TypeScript Windows IME candidates");
-        return *description ? S_OK : E_OUTOFMEMORY;
-    }
-    HRESULT STDMETHODCALLTYPE GetGUID(GUID* guid) override {
-        if (!guid) return E_POINTER;
-        *guid = kCandidateListUiElementGuid;
-        return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE Show(BOOL show) override { shown_ = show; return S_OK; }
-    HRESULT STDMETHODCALLTYPE IsShown(BOOL* show) override {
-        if (!show) return E_POINTER;
-        *show = shown_;
-        return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE GetUpdatedFlags(DWORD* flags) override {
-        if (!flags) return E_POINTER;
-        *flags = TF_CLUIE_DOCUMENTMGR | TF_CLUIE_COUNT | TF_CLUIE_SELECTION |
-            TF_CLUIE_STRING | TF_CLUIE_PAGEINDEX | TF_CLUIE_CURRENTPAGE;
-        return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE GetDocumentMgr(ITfDocumentMgr** documentMgr) override {
-        if (!documentMgr) return E_POINTER;
-        *documentMgr = documentMgr_;
-        if (*documentMgr) (*documentMgr)->AddRef();
-        return *documentMgr ? S_OK : E_UNEXPECTED;
-    }
-    HRESULT STDMETHODCALLTYPE GetCount(UINT* count) override {
-        if (!count) return E_POINTER;
-        *count = static_cast<UINT>(candidates_.size());
-        return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE GetSelection(UINT* index) override {
-        if (!index) return E_POINTER;
-        *index = selection_;
-        return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE GetString(UINT index, BSTR* string) override {
-        if (!string) return E_POINTER;
-        *string = nullptr;
-        if (index >= candidates_.size()) return E_INVALIDARG;
-        const std::wstring wide = Utf8ToWide(candidates_[index]);
-        *string = SysAllocStringLen(wide.data(), static_cast<UINT>(wide.size()));
-        return *string ? S_OK : E_OUTOFMEMORY;
-    }
-    HRESULT STDMETHODCALLTYPE GetPageIndex(UINT* index, UINT size, UINT* pageCount) override {
-        if (!pageCount) return E_POINTER;
-        *pageCount = 1;
-        if (size == 0) return S_OK;
-        if (!index) return E_POINTER;
-        const UINT count = static_cast<UINT>(candidates_.size());
-        const UINT limit = (size < count) ? size : count;
-        for (UINT i = 0; i < limit; ++i) index[i] = 0;
-        return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE SetPageIndex(UINT*, UINT pageCount) override {
-        return pageCount == 1 ? S_OK : E_INVALIDARG;
-    }
-    HRESULT STDMETHODCALLTYPE GetCurrentPage(UINT* page) override {
-        if (!page) return E_POINTER;
-        *page = 0;
-        return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE SetSelection(UINT index) override {
-        if (index >= candidates_.size()) return E_INVALIDARG;
-        selection_ = index;
-        return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE Finalize() override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE Abort() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie ec) override {
+        if (!context_ || !composition_ || !caret_) return E_UNEXPECTED;
+        ITfRange* range = nullptr;
+        HRESULT hr = composition_->GetRange(&range);
+        if (FAILED(hr)) {
+            NativeLog::Hr("CaretProbe GetRange", hr);
+            hr_ = hr;
+            return hr;
+        }
+        ITfContextView* view = nullptr;
+        hr = context_->GetActiveView(&view);
+        if (FAILED(hr) || !view) {
+            NativeLog::Hr("CaretProbe GetActiveView", FAILED(hr) ? hr : E_UNEXPECTED);
+            range->Release();
+            hr_ = FAILED(hr) ? hr : E_UNEXPECTED;
+            return hr_;
+        }
 
-    void Update(std::vector<std::string> candidates, UINT selection) {
-        candidates_ = std::move(candidates);
-        selection_ = candidates_.empty() ? 0 : (selection < candidates_.size() ? selection : 0);
-        shown_ = !candidates_.empty();
-    }
+        RECT rect{};
+        BOOL clipped = FALSE;
+        ITfRange* end = nullptr;
+        if (SUCCEEDED(range->Clone(&end)) && end) {
+            end->Collapse(ec, TF_ANCHOR_END);
+            hr = view->GetTextExt(ec, end, &rect, &clipped);
+            end->Release();
+        } else {
+            hr = E_FAIL;
+        }
+        if (FAILED(hr) || rect.right <= rect.left) {
+            NativeLog::Write("CaretProbe caret end hr=0x%08lX rect=%ld,%ld,%ld,%ld",
+                static_cast<unsigned long>(hr), rect.left, rect.top, rect.right, rect.bottom);
+            RECT whole{};
+            hr = view->GetTextExt(ec, range, &whole, &clipped);
+            if (SUCCEEDED(hr) && whole.right > whole.left) rect = whole;
+        }
+        view->Release();
+        range->Release();
 
+        if (rect.right > rect.left && rect.bottom > rect.top) *caret_ = rect;
+        NativeLog::Write("CaretProbe result hr=0x%08lX rect=%ld,%ld,%ld,%ld",
+            static_cast<unsigned long>(hr), rect.left, rect.top, rect.right, rect.bottom);
+        hr_ = FAILED(hr) ? hr : (rect.right > rect.left ? S_OK : E_FAIL);
+        return hr_;
+    }
 private:
     LONG refCount_;
-    ITfDocumentMgr* documentMgr_;
-    std::vector<std::string> candidates_;
-    UINT selection_;
-    BOOL shown_;
+    ITfContext* context_;
+    ITfComposition* composition_;
+    RECT* caret_;
+    HRESULT hr_;
 };
 
 class CompositionSink final : public ITfCompositionSink {
 public:
-    CompositionSink() : refCount_(1) {}
+    explicit CompositionSink(TextService* service) : refCount_(1), service_(service) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
         if (!object) return E_POINTER;
         *object = nullptr;
@@ -260,15 +245,18 @@ public:
         if (!count) delete this;
         return count;
     }
-    HRESULT STDMETHODCALLTYPE OnCompositionTerminated(TfEditCookie, ITfComposition*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnCompositionTerminated(TfEditCookie, ITfComposition*) override;
 private:
     LONG refCount_;
+    TextService* service_;
 };
 
 class CompositionEditSession final : public ITfEditSession {
 public:
-    CompositionEditSession(ITfContext* context, ITfComposition* composition, const std::string& text, bool commit)
-        : refCount_(1), context_(context), composition_(composition), text_(text), commit_(commit), hr_(E_FAIL) {
+    CompositionEditSession(TextService* service, ITfContext* context, ITfComposition* composition,
+                           const std::string& text, bool commit)
+        : refCount_(1), service_(service), context_(context), composition_(composition), text_(text),
+          commit_(commit), hr_(E_FAIL) {
         if (context_) context_->AddRef();
         if (composition_) composition_->AddRef();
     }
@@ -297,12 +285,15 @@ public:
         if (!count) delete this;
         return count;
     }
-    HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie ec) override {
+HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie ec) override {
         if (!context_) return E_UNEXPECTED;
 
         ITfContextComposition* contextComposition = nullptr;
         HRESULT hr = context_->QueryInterface(IID_ITfContextComposition, reinterpret_cast<void**>(&contextComposition));
-        if (FAILED(hr)) return hr;
+        if (FAILED(hr)) {
+            NativeLog::Hr("CompositionEditSession QueryInterface(ITfContextComposition)", hr);
+            return hr;
+        }
 
         if (text_.empty()) {
             if (composition_) {
@@ -315,6 +306,19 @@ public:
             return hr;
         }
 
+        if (composition_) {
+            // An application may end the composition behind our back. A dead
+            // ITfComposition must not poison every later edit session.
+            ITfRange* probe = nullptr;
+            if (FAILED(composition_->GetRange(&probe)) || !probe) {
+                NativeLog::Write("CompositionEditSession stale composition discarded");
+                composition_->Release();
+                composition_ = nullptr;
+            } else {
+                probe->Release();
+            }
+        }
+
         if (!composition_) {
             TF_SELECTION selection{};
             ULONG fetched = 0;
@@ -322,10 +326,12 @@ public:
             if (FAILED(hr) || fetched != 1) {
                 contextComposition->Release();
                 hr_ = FAILED(hr) ? hr : E_FAIL;
+                NativeLog::Write("CompositionEditSession GetSelection failed hr=0x%08lX fetched=%lu",
+                    static_cast<unsigned long>(hr_), fetched);
                 return hr_;
             }
 
-            auto* sink = new (std::nothrow) CompositionSink();
+            auto* sink = new (std::nothrow) CompositionSink(service_);
             if (!sink) {
                 contextComposition->Release();
                 hr_ = E_OUTOFMEMORY;
@@ -338,8 +344,10 @@ public:
             if (FAILED(hr)) {
                 contextComposition->Release();
                 hr_ = hr;
+                NativeLog::Hr("CompositionEditSession StartComposition", hr);
                 return hr_;
             }
+            NativeLog::Write("CompositionEditSession StartComposition ok composition=%p", composition_);
         }
 
         ITfRange* range = nullptr;
@@ -347,11 +355,13 @@ public:
         if (SUCCEEDED(hr)) {
             const std::wstring wideText = Utf8ToWide(text_);
             hr = range->SetText(ec, 0, wideText.c_str(), static_cast<LONG>(wideText.size()));
+            if (SUCCEEDED(hr)) ReadCaretRect(ec, range);
             if (SUCCEEDED(hr) && commit_) {
                 hr = composition_->EndComposition(ec);
             }
             range->Release();
         }
+        if (FAILED(hr)) NativeLog::Write("CompositionEditSession apply text failed hr=0x%08lX", static_cast<unsigned long>(hr));
 
         if (commit_ && composition_) {
             composition_->Release();
@@ -362,13 +372,44 @@ public:
         return hr;
     }
 
+    // Screen coordinates of the insertion point at the end of the composition.
+    // The candidate window is drawn there. Applications that do not implement
+    // ITfContextView leave this empty and the window falls back to the caret.
+    const RECT& CaretRect() const { return caretRect_; }
+
     HRESULT Result() const { return hr_; }
 private:
+    void ReadCaretRect(TfEditCookie ec, ITfRange* range) {
+        ITfContextView* view = nullptr;
+        if (FAILED(context_->GetActiveView(&view)) || !view) {
+            return;
+        }
+        // The insertion point anchors the window. Applications that have not
+        // laid out the fresh composition yet fail on the collapsed range, so
+        // the whole composition rectangle is used as the fallback anchor.
+        ITfRange* end = nullptr;
+        if (SUCCEEDED(range->Clone(&end)) && end) {
+            end->Collapse(ec, TF_ANCHOR_END);
+            RECT rect{};
+            BOOL clipped = FALSE;
+            if (SUCCEEDED(view->GetTextExt(ec, end, &rect, &clipped))) caretRect_ = rect;
+            end->Release();
+        }
+        if (caretRect_.right <= caretRect_.left) {
+            RECT rect{};
+            BOOL clipped = FALSE;
+            if (SUCCEEDED(view->GetTextExt(ec, range, &rect, &clipped))) caretRect_ = rect;
+        }
+        view->Release();
+    }
+
     LONG refCount_;
+    TextService* service_;
     ITfContext* context_;
     std::string text_;
     bool commit_;
     HRESULT hr_;
+    RECT caretRect_{};
     ITfComposition* composition_ = nullptr;
 };
 
@@ -398,10 +439,10 @@ private:
 
 class TextService final : public ITfTextInputProcessor {
 public:
-    TextService()
+TextService()
         : refCount_(1), threadMgr_(nullptr), keyMgr_(nullptr), keySink_(nullptr),
           clientId_(TF_CLIENTID_NULL), keySinkAdvised_(false), nextRequestId_(1), pipe_(250), compositionContext_(nullptr),
-          compositionText_(), uiElementMgr_(nullptr), candidateElement_(nullptr), candidateUiElementId_(0) {
+          compositionText_() {
         InterlockedIncrement(&g_objectCount);
     }
 
@@ -466,8 +507,10 @@ public:
         // IPC is optional during activation. TSF activation must remain fast
         // even when the Node/host process is not running yet; key handling
         // will use the short reconnect path below.
-        const bool pipeConnected = pipe_.ConnectToServer(kPipeName, 250);
+const bool pipeConnected = pipe_.ConnectToServer(kPipeName, 250);
         NativeLog::Write("TextService::Activate pipe connect=%d", pipeConnected ? 1 : 0);
+        g_activeService = this;
+        CandidateWindow::SetCaretProvider(&ReadCaretRectFromService);
         NativeLog::Write("TextService::Activate success this=%p", this);
 
         return S_OK;
@@ -500,28 +543,30 @@ public:
             composition_->Release();
             composition_ = nullptr;
         }
-        compositionText_.clear();
-        HideCandidates();
-        if (uiElementMgr_) {
-            uiElementMgr_->Release();
-            uiElementMgr_ = nullptr;
+compositionText_.clear();
+        if (g_activeService == this) {
+            g_activeService = nullptr;
+            CandidateWindow::SetCaretProvider(nullptr);
         }
+        CandidateWindow::Destroy();
         NativeLog::Write("TextService::Deactivate complete this=%p", this);
         return S_OK;
     }
 
-    bool TestKey(ITfContext*, WPARAM wParam, LPARAM, bool& consume);
+bool TestKey(ITfContext*, WPARAM wParam, LPARAM, bool& consume);
     bool HandleKey(ITfContext* context, WPARAM wParam, LPARAM, bool& consume);
     void LogActiveProfile(const char* where) const;
+    void OnCompositionTerminated();
+    bool ProbeCaretRect(RECT& caret);
 
 private:
     static std::string KeyName(WPARAM vk);
     static int Modifiers();
 
-    bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
+bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
                   std::string& response);
     bool ApplyResponse(ITfContext* context, const std::string& response);
-    bool UpdateCandidates(ITfContext* context, const std::string& response);
+    bool UpdateCandidates(ITfContext* context, const std::string& response, RECT caret);
     void HideCandidates();
 
     LONG refCount_;
@@ -534,10 +579,8 @@ private:
     PipeBridge pipe_;
     ITfContext* compositionContext_;
     std::string compositionText_;
+    RECT lastCaretRect_{};
     ITfComposition* composition_ = nullptr;
-    ITfUIElementMgr* uiElementMgr_;
-    CandidateListUIElement* candidateElement_;
-    DWORD candidateUiElementId_;
 };
 
 HRESULT KeyEventSink::OnSetFocus(BOOL foreground) {
@@ -680,16 +723,28 @@ bool TextService::ApplyResponse(ITfContext* context, const std::string& response
     for (size_t i = 0; i < candidates.size(); ++i) {
         NativeLog::Write("ApplyResponse candidate[%zu]=%s", i, candidates[i].c_str());
     }
-    if (!context) return false;
-    CompositionEditSession session(context, composition_, text, hasCommit);
+if (!context) return false;
+    CompositionEditSession session(this, context, composition_, text, hasCommit);
     HRESULT sessionResult = E_FAIL;
     const HRESULT requestResult = context->RequestEditSession(
         clientId_, &session, TF_ES_SYNC | TF_ES_READWRITE, &sessionResult);
     NativeLog::Write("ApplyResponse RequestEditSession request=0x%08lX session=0x%08lX",
         static_cast<unsigned long>(requestResult), static_cast<unsigned long>(sessionResult));
-    if (FAILED(requestResult) || FAILED(sessionResult)) return false;
+    if (FAILED(requestResult) || FAILED(sessionResult)) {
+        // A rejected edit session must not stay broken: drop the composition so
+        // the next keystroke starts a fresh one instead of failing forever.
+        NativeLog::Write("ApplyResponse edit session rejected; dropping composition state");
+        if (composition_) {
+            composition_->Release();
+            composition_ = nullptr;
+        }
+        compositionContext_ = nullptr;
+        compositionText_.clear();
+        HideCandidates();
+        return false;
+    }
 
-    if (hasCommit || composition.empty()) {
+if (hasCommit || composition.empty()) {
         HideCandidates();
         compositionContext_ = nullptr;
         compositionText_.clear();
@@ -701,16 +756,23 @@ bool TextService::ApplyResponse(ITfContext* context, const std::string& response
         if (!composition_) composition_ = session.DetachComposition();
         compositionContext_ = context;
         compositionText_ = composition;
-        if (!UpdateCandidates(context, response)) return false;
+        if (!UpdateCandidates(context, response, session.CaretRect())) return false;
     }
     return true;
 }
 
-bool TextService::UpdateCandidates(ITfContext* context, const std::string& response) {
+bool TextService::UpdateCandidates(ITfContext* context, const std::string& response, RECT caret) {
     const std::vector<std::string> candidates = JsonCandidateTexts(response);
     const UINT selection = JsonUInt(response, "selectedCandidate", 0);
-    NativeLog::Write("UpdateCandidates context=%p count=%zu selected=%u existing=%d",
-        context, candidates.size(), selection, candidateElement_ ? 1 : 0);
+    // Keep the last known anchor: an application can report no layout right
+    // after the composition text changed, and the window must stay where it was.
+    if (caret.right > caret.left || caret.bottom > caret.top) {
+        lastCaretRect_ = caret;
+    } else {
+        caret = lastCaretRect_;
+    }
+    NativeLog::Write("UpdateCandidates context=%p count=%zu selected=%u caret=%ld,%ld,%ld,%ld",
+        context, candidates.size(), selection, caret.left, caret.top, caret.right, caret.bottom);
     for (size_t i = 0; i < candidates.size(); ++i) {
         NativeLog::Write("UpdateCandidates candidate[%zu]=%s", i, candidates[i].c_str());
     }
@@ -719,63 +781,53 @@ bool TextService::UpdateCandidates(ITfContext* context, const std::string& respo
         HideCandidates();
         return true;
     }
-    if (!uiElementMgr_) {
-        if (!threadMgr_) return false;
-        const HRESULT hr = threadMgr_->QueryInterface(IID_ITfUIElementMgr, reinterpret_cast<void**>(&uiElementMgr_));
-        NativeLog::Hr("UpdateCandidates QueryInterface(ITfUIElementMgr)", hr);
-        if (FAILED(hr)) return false;
-    }
-
-    if (candidateElement_) {
-        candidateElement_->Update(candidates, selection);
-        candidateElement_->Show(TRUE);
-        NativeLog::Write("UpdateCandidates -> updating UI element id=%lu",
-            static_cast<unsigned long>(candidateUiElementId_));
-        const HRESULT hr = uiElementMgr_->UpdateUIElement(candidateUiElementId_);
-        NativeLog::Hr("UpdateCandidates UpdateUIElement", hr);
-        return SUCCEEDED(hr);
-    }
-
-    ITfDocumentMgr* documentMgr = nullptr;
-    HRESULT hr = context->GetDocumentMgr(&documentMgr);
-    if (FAILED(hr) || !documentMgr) {
-        NativeLog::Hr("UpdateCandidates GetDocumentMgr", FAILED(hr) ? hr : E_UNEXPECTED);
+    if (!CandidateWindow::Show(WideCandidates(candidates), selection, caret)) {
+        NativeLog::Write("UpdateCandidates -> CandidateWindow::Show failed");
         return false;
     }
-    auto* element = new (std::nothrow) CandidateListUIElement(documentMgr, candidates, selection);
-    documentMgr->Release();
-    if (!element) return false;
-
-    BOOL show = TRUE;
-    DWORD elementId = 0;
-    hr = uiElementMgr_->BeginUIElement(static_cast<ITfUIElement*>(element), &show, &elementId);
-    NativeLog::Hr("UpdateCandidates BeginUIElement", hr);
-    if (FAILED(hr)) {
-        element->Release();
-        return false;
-    }
-    element->Show(show ? TRUE : FALSE);
-    candidateElement_ = element;
-    candidateUiElementId_ = elementId;
-    NativeLog::Write("UpdateCandidates -> created UI element id=%lu show=%d",
-        static_cast<unsigned long>(elementId), show ? 1 : 0);
-    hr = uiElementMgr_->UpdateUIElement(candidateUiElementId_);
-    NativeLog::Hr("UpdateCandidates initial UpdateUIElement", hr);
-    return SUCCEEDED(hr);
+    return true;
 }
 
 void TextService::HideCandidates() {
-    if (candidateElement_) {
-        NativeLog::Write("HideCandidates id=%lu", static_cast<unsigned long>(candidateUiElementId_));
-        candidateElement_->Show(FALSE);
-        if (uiElementMgr_ && candidateUiElementId_ != 0) {
-            const HRESULT hr = uiElementMgr_->EndUIElement(candidateUiElementId_);
-            NativeLog::Hr("HideCandidates EndUIElement", hr);
-        }
-        candidateElement_->Release();
-        candidateElement_ = nullptr;
-        candidateUiElementId_ = 0;
+    CandidateWindow::Hide();
+}
+
+void TextService::OnCompositionTerminated() {
+    if (composition_) {
+        composition_->Release();
+        composition_ = nullptr;
     }
+    compositionContext_ = nullptr;
+    compositionText_.clear();
+    HideCandidates();
+}
+
+bool TextService::ProbeCaretRect(RECT& caret) {
+    if (!compositionContext_ || !composition_) return false;
+    CaretProbeSession session(compositionContext_, composition_, &caret);
+    HRESULT sessionResult = E_FAIL;
+    const HRESULT request = compositionContext_->RequestEditSession(
+        clientId_, &session, TF_ES_SYNC | TF_ES_READWRITE, &sessionResult);
+    if (FAILED(request) || FAILED(sessionResult)) {
+        NativeLog::Write("ProbeCaretRect edit session failed request=0x%08lX session=0x%08lX",
+            static_cast<unsigned long>(request), static_cast<unsigned long>(sessionResult));
+        return false;
+    }
+    return caret.right > caret.left && caret.bottom > caret.top;
+}
+
+bool ReadCaretRectFromService(RECT& caret) {
+    TextService* service = g_activeService;
+    return service ? service->ProbeCaretRect(caret) : false;
+}
+
+HRESULT CompositionSink::OnCompositionTerminated(TfEditCookie, ITfComposition*) {
+    // The application ended the composition on its own. Keeping the stale
+    // ITfComposition makes every later edit session fail, so the service drops
+    // it here instead of waiting for the next commit.
+    NativeLog::Write("CompositionSink::OnCompositionTerminated service=%p", service_);
+    if (service_) service_->OnCompositionTerminated();
+    return S_OK;
 }
 
 HRESULT KeyEventSink::OnTestKeyDown(ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
