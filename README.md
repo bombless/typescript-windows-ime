@@ -29,14 +29,11 @@ The IPC uses UTF-8 JSON Lines over two Windows Named Pipes. Start
 The native Host owns both Named Pipe servers and remains online independently
 of TSF activation. The TypeScript process and TSF DLL connect as clients.
 
-Native DLLs are split into build and install locations: `native\\build\\TypeScriptWindowsIme.dll` is produced by `build.ps1`, while `native\\install\\TypeScriptWindowsIme-current.dll` is the copy registered with Windows. `build.ps1` never touches the installed copy. If an older COM registration or TSF host still has the old DLL loaded, run `native\\cleanup-com.ps1` from an elevated PowerShell to unregister the project CLSID, stop common TSF hosts, and restart `ctfmon` before rebuilding.
-
 The pipe Host follows the same split. `build.ps1` links
 `native\\build\\TypeScriptWindowsImeHost.exe`; `native\\install-host.ps1` (also
 `npm run host`) stops any running Host, copies the build into
 `native\\install\\TypeScriptWindowsImeHost-<timestamp>.exe`, and starts it, so a
-running Host never blocks `build.ps1` with LNK1104. Only one Host can run at a
-time because of its singleton mutex.
+running Host never blocks `build.ps1` with LNK1104.
 
 Phase 0/1 deliberately keeps behavior small: alphabetic `keyDown` events produce a lowercase composition; the native adapter remains responsible for Windows TSF/COM concerns.
 

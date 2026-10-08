@@ -65,26 +65,46 @@ function handleConnection(socket: Socket): void {
   socket.on("close", () => console.log("[PIPE] disconnected from C++"));
 }
 
-export function startPipeClient(pipeName = PIPE_NAME): { close(): void } {
+export interface PipeClient {
+  close(): void;
+}
+
+export interface PipeClientCallbacks {
+  onConnected?: () => void;
+  onUnavailable?: (error: Error) => void;
+  onDisconnected?: () => void;
+}
+
+export function startPipeClient(pipeName = PIPE_NAME, callbacks: PipeClientCallbacks = {}): PipeClient {
   let socket: Socket | undefined;
   let stopped = false;
+  let connected = false;
 
   const connect = () => {
     if (stopped || socket) return;
     const next = createConnection(pipeName);
     socket = next;
     handleConnection(next);
-    next.once("connect", () => console.log(`[PIPE] connected to C++: ${pipeName}`));
+    next.once("connect", () => {
+      connected = true;
+      console.log(`[PIPE] connected to Host: ${pipeName}`);
+      callbacks.onConnected?.();
+    });
     next.once("error", (error) => {
       const code = (error as NodeJS.ErrnoException).code;
-      console.log(`[PIPE] connection error: ${code ?? error.message}`);
+      if (!connected) {
+        const detail = code ? `${code}: ${error.message}` : error.message;
+        callbacks.onUnavailable?.(new Error(detail, { cause: error }));
+      } else {
+        console.error(`[PIPE] socket error: ${code ?? error.message}`);
+      }
     });
     next.once("close", () => {
       if (socket === next) socket = undefined;
-      // The C++ server intentionally lets the newest client win. If another
-      // client connects, this socket may be kicked; do not reconnect here or
-      // Node would immediately steal the pipe back from the new client.
-      if (!stopped) console.log("[PIPE] not reconnecting after disconnect; yielding to the newer client");
+      // Host owns replacement. A displaced client must exit, never reconnect
+      // and steal the pipe back from the newer process.
+      if (!stopped && connected) callbacks.onDisconnected?.();
+      else if (!stopped && !connected) callbacks.onUnavailable?.(new Error(`Could not connect to Host pipe ${pipeName}`));
     });
   };
 
