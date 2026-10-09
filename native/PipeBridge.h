@@ -20,6 +20,7 @@ public:
     void Disconnect();
     bool IsConnected();
     bool Call(const std::string& requestJson, std::string& responseJson, unsigned int requestId);
+    bool Notify(const std::string& requestJson);
 
 private:
     void AcceptLoop();
@@ -35,6 +36,7 @@ private:
     HANDLE listenerReadyEvent_;
     std::thread acceptThread_;
     std::mutex mutex_;
+    std::mutex callCoreMutex_;
     std::wstring pipeName_;
     bool acceptStarted_;
     DWORD timeoutMs_;

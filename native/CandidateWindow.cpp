@@ -20,9 +20,6 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"TypeScriptWindowsImeCandidateWindow";
 constexpr size_t kMaxVisible = 9;
 constexpr UINT_PTR kArrowCursorResource = 32512;
-constexpr UINT_PTR kCaretRetryTimer = 1;
-constexpr int kCaretRetryDelayMs = 40;
-constexpr int kCaretRetries = 12;
 
 HWND g_window = nullptr;
 bool g_classRegistered = false;
@@ -34,9 +31,6 @@ int g_rowHeight = 0;
 int g_numberWidth = 0;
 int g_width = 0;
 int g_height = 0;
-CaretProvider g_caretProvider = nullptr;
-int g_caretRetriesLeft = 0;
-bool g_waitingForCaret = false;
 
 int Scale(int value) { return MulDiv(value, static_cast<int>(g_dpi), 96); }
 size_t Visible(size_t count) { return count < kMaxVisible ? count : kMaxVisible; }
@@ -251,29 +245,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_NCHITTEST:
         // Keep clicks on the composition text working while the list floats.
         return HTTRANSPARENT;
-    case WM_TIMER: {
-        // The application needed more time to lay out the composition. Ask
-        // again and move the list under the caret as soon as it is known.
-        if (wParam != kCaretRetryTimer) break;
-        if (!g_caretProvider) {
-            KillTimer(window, kCaretRetryTimer);
-            return 0;
-        }
-        RECT caret{};
-        if (g_caretProvider(caret) && caret.right > caret.left) {
-            KillTimer(window, kCaretRetryTimer);
-            g_waitingForCaret = false;
-            Place(window, caret);
-            return 0;
-        }
-        if (--g_caretRetriesLeft <= 0) {
-            KillTimer(window, kCaretRetryTimer);
-            NativeLog::Write("CandidateWindow gave up waiting for a caret rectangle");
-            g_waitingForCaret = false;
-            Place(window, ApplicationRect());
-        }
-        return 0;
-    }
     case WM_DESTROY:
         if (g_window == window) g_window = nullptr;
         return 0;
@@ -324,26 +295,6 @@ bool IsCaretRectEmpty(const RECT& rect) {
     return rect.right <= rect.left && rect.bottom <= rect.top;
 }
 
-// The Win32 caret of this thread. Other processes and hidden helper windows
-// also report one, so a foreign caret is rejected instead of moving the list
-// into an unrelated corner of a multi-monitor desktop.
-RECT CaretFallback() {
-    GUITHREADINFO info{};
-    info.cbSize = sizeof(info);
-    if (GetGUIThreadInfo(0, &info) && !IsCaretRectEmpty(info.rcCaret)) {
-        DWORD ownerPid = 0;
-        GetWindowThreadProcessId(info.hwndCaret, &ownerPid);
-        if (ownerPid == GetCurrentProcessId()) {
-            NativeLog::Write("CandidateWindow caret fallback from thread caret %ld,%ld,%ld,%ld",
-                info.rcCaret.left, info.rcCaret.top, info.rcCaret.right, info.rcCaret.bottom);
-            return info.rcCaret;
-        }
-    }
-    return RECT{};
-}
-
-// Top-left corner of the application window. Used when no caret rectangle is
-// available so the list still shows up inside the window the user is typing in.
 RECT ApplicationRect() {
     HWND foreground = GetForegroundWindow();
     if (!foreground) return RECT{};
@@ -368,15 +319,15 @@ void Place(HWND window, RECT caret) {
     monitorInfo.cbSize = sizeof(monitorInfo);
     if (monitor && GetMonitorInfoW(monitor, &monitorInfo)) workArea = monitorInfo.rcMonitor;
 
-    // TEMPORARY VISIBILITY TEST: cover the full monitor width from the caret
-    // down to the physical bottom edge. Clamp to ensure a positive-size window.
-    const int x = workArea.left;
-    const int y = ClampToWorkArea(caret.bottom, workArea.top, workArea.bottom - 1);
-    const int width = workArea.right - workArea.left;
-    const int height = workArea.bottom - y;
+    const int x = ClampToWorkArea(caret.left, workArea.left, workArea.right - g_width);
+    const int below = workArea.bottom - caret.bottom;
+    const int above = caret.top - workArea.top;
+    const int y = (g_height <= below || below >= above)
+        ? ClampToWorkArea(caret.bottom, workArea.top, workArea.bottom - g_height)
+        : ClampToWorkArea(caret.top - g_height, workArea.top, workArea.bottom - g_height);
+    const int width = g_width;
+    const int height = g_height;
     if (width <= 0 || height <= 0) return;
-    g_width = width;
-    g_height = height;
 
     SetWindowPos(window, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(window, nullptr, FALSE);
@@ -414,7 +365,7 @@ bool Measure(int& width, int& height) {
 
 } // namespace
 
-bool Show(const std::vector<std::wstring>& candidates, UINT selection, RECT caret) {
+bool Show(const std::vector<std::wstring>& candidates, UINT selection, RECT caret, UINT dpi) {
     const size_t visible = Visible(candidates.size());
     if (visible == 0) {
         Hide();
@@ -422,7 +373,6 @@ bool Show(const std::vector<std::wstring>& candidates, UINT selection, RECT care
     }
     HWND window = EnsureWindow();
     if (!window) return false;
-    UINT dpi = GetDpiForWindow(window);
     if (dpi == 0) dpi = GetDpiForSystem();
     if (dpi == 0) dpi = 96;
     if (!EnsureFont(dpi)) return false;
@@ -434,7 +384,6 @@ bool Show(const std::vector<std::wstring>& candidates, UINT selection, RECT care
 
     // Repaint synchronously: the key handler must not return before the list is
     // on screen, and some hosts keep their message loop busy afterwards.
-    if (IsCaretRectEmpty(caret)) caret = CaretFallback();
     Place(window, caret);
     // Place already shows the window through SetWindowPos, but ShowWindow is
     // still needed: a window that has never been shown has no DWM redirection
@@ -446,38 +395,18 @@ bool Show(const std::vector<std::wstring>& candidates, UINT selection, RECT care
     RedrawWindow(window, nullptr, nullptr,
         RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_FRAME | RDW_ALLCHILDREN);
 
-    if (IsCaretRectEmpty(caret) && g_caretProvider) {
-        // No caret yet: keep the list visible near the application window and
-        // move it as soon as the application reports the real position.
-        g_caretRetriesLeft = kCaretRetries;
-        g_waitingForCaret = true;
-        SetTimer(window, kCaretRetryTimer, kCaretRetryDelayMs, nullptr);
-        NativeLog::Write("CandidateWindow waiting for a caret rectangle retries=%d", kCaretRetries);
-    }
     NativeLog::Write("CandidateWindow Show count=%u selection=%u size=%dx%d dpi=%u",
         static_cast<unsigned>(g_candidates.size()), g_selection, g_width, g_height, g_dpi);
     return true;
 }
 
-void SetCaretProvider(CaretProvider provider) {
-    g_caretProvider = provider;
-    if (!provider && g_window && IsWindow(g_window)) {
-        KillTimer(g_window, kCaretRetryTimer);
-        g_caretRetriesLeft = 0;
-        g_waitingForCaret = false;
-    }
-}
-
 void Hide() {
     if (g_window && IsWindow(g_window)) {
-        KillTimer(g_window, kCaretRetryTimer);
         NativeLog::Write("CandidateWindow Hide");
         ShowWindow(g_window, SW_HIDE);
     }
     g_candidates.clear();
     g_selection = 0;
-    g_caretRetriesLeft = 0;
-    g_waitingForCaret = false;
 }
 
 void Destroy() {
@@ -492,6 +421,11 @@ void Destroy() {
     g_numberWidth = 0;
     g_width = 0;
     g_height = 0;
+}
+
+bool Show(const std::vector<std::wstring>& candidates, UINT selection, RECT caret) {
+    UINT dpi = GetDpiForSystem();
+    return Show(candidates, selection, caret, dpi ? dpi : 96);
 }
 
 bool IsVisible() {

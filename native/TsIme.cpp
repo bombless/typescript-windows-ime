@@ -1,6 +1,6 @@
 #define INITGUID
 #include "TsIme.h"
-#include "CandidateWindow.h"
+
 #include "PipeBridge.h"
 #include "NativeLog.h"
 
@@ -23,6 +23,12 @@ constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf";
 // The candidate window asks for the caret rectangle from a timer, so the
 // service that owns the current composition has to be reachable from there.
 TextService* g_activeService = nullptr;
+HWND g_caretRetryWindow = nullptr;
+constexpr UINT_PTR kCaretRetryTimer = 1;
+constexpr int kCaretRetryDelayMs = 40;
+constexpr int kCaretRetries = 12;
+bool CreateCaretRetryWindow();
+void DestroyCaretRetryWindow();
 // TSF activates one text service per application process and the Host
 // multiplexes every one of them over a single Node connection. Request ids
 // restart at 1 in each process, so they cannot identify a request on their
@@ -548,7 +554,7 @@ TextService()
 const bool pipeConnected = pipe_.ConnectToServer(kPipeName, 250);
         NativeLog::Write("TextService::Activate pipe connect=%d", pipeConnected ? 1 : 0);
         g_activeService = this;
-        CandidateWindow::SetCaretProvider(&ReadCaretRectFromService);
+        CreateCaretRetryWindow();
         NativeLog::Write("TextService::Activate success this=%p", this);
 
         return S_OK;
@@ -584,9 +590,8 @@ const bool pipeConnected = pipe_.ConnectToServer(kPipeName, 250);
 compositionText_.clear();
         if (g_activeService == this) {
             g_activeService = nullptr;
-            CandidateWindow::SetCaretProvider(nullptr);
         }
-        CandidateWindow::Destroy();
+        DestroyCaretRetryWindow();
         NativeLog::Write("TextService::Deactivate complete this=%p", this);
         return S_OK;
     }
@@ -596,6 +601,7 @@ bool TestKey(ITfContext*, WPARAM wParam, LPARAM, bool& consume);
     void LogActiveProfile(const char* where) const;
     void OnCompositionTerminated();
     bool ProbeCaretRect(RECT& caret);
+    void RetryCaret();
 
 private:
     static std::string KeyName(WPARAM vk);
@@ -621,9 +627,61 @@ bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
     PipeBridge pipe_;
     ITfContext* compositionContext_;
     std::string compositionText_;
+    std::string lastCandidateResponse_;
+    int caretRetriesLeft_ = 0;
     RECT lastCaretRect_{};
     ITfComposition* composition_ = nullptr;
 };
+
+void TextService::RetryCaret() {
+    if (caretRetriesLeft_ <= 0) {
+        if (g_caretRetryWindow) KillTimer(g_caretRetryWindow, kCaretRetryTimer);
+        return;
+    }
+    RECT caret{};
+    if (ProbeCaretRect(caret)) {
+        caretRetriesLeft_ = 0;
+        lastCaretRect_ = caret;
+        if (g_caretRetryWindow) KillTimer(g_caretRetryWindow, kCaretRetryTimer);
+        UpdateCandidates(compositionContext_, lastCandidateResponse_, caret);
+        return;
+    }
+    if (--caretRetriesLeft_ <= 0 && g_caretRetryWindow) KillTimer(g_caretRetryWindow, kCaretRetryTimer);
+}
+
+LRESULT CALLBACK CaretRetryWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM) {
+    if (message == WM_TIMER && wParam == kCaretRetryTimer) {
+        TextService* service = g_activeService;
+        if (service) service->RetryCaret();
+        return 0;
+    }
+    return DefWindowProcW(window, message, wParam, 0);
+}
+
+bool CreateCaretRetryWindow() {
+    if (g_caretRetryWindow && IsWindow(g_caretRetryWindow)) return true;
+    static const wchar_t kClassName[] = L"TypeScriptWindowsImeCaretRetry";
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = CaretRetryWindowProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = kClassName;
+        if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+        registered = true;
+    }
+    g_caretRetryWindow = CreateWindowExW(0, kClassName, L"", 0, 0, 0, 0, 0,
+        HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+    return g_caretRetryWindow != nullptr;
+}
+
+void DestroyCaretRetryWindow() {
+    if (g_caretRetryWindow) {
+        KillTimer(g_caretRetryWindow, kCaretRetryTimer);
+        DestroyWindow(g_caretRetryWindow);
+        g_caretRetryWindow = nullptr;
+    }
+}
 
 HRESULT KeyEventSink::OnSetFocus(BOOL foreground) {
     LogForegroundContext("OnSetFocus", nullptr);
@@ -813,6 +871,7 @@ if (hasCommit || composition.empty()) {
 }
 
 bool TextService::UpdateCandidates(ITfContext* context, const std::string& response, RECT caret) {
+    lastCandidateResponse_ = response;
     LogForegroundContext("UpdateCandidates", context);
     const std::vector<std::string> candidates = JsonCandidateTexts(response);
     const UINT selection = JsonUInt(response, "selectedCandidate", 0);
@@ -822,6 +881,10 @@ bool TextService::UpdateCandidates(ITfContext* context, const std::string& respo
         lastCaretRect_ = caret;
     } else {
         caret = lastCaretRect_;
+        if (caret.right <= caret.left || caret.bottom <= caret.top) {
+            caretRetriesLeft_ = kCaretRetries;
+            if (g_caretRetryWindow) SetTimer(g_caretRetryWindow, kCaretRetryTimer, kCaretRetryDelayMs, nullptr);
+        }
     }
     NativeLog::Write("UpdateCandidates context=%p count=%zu selected=%u caret=%ld,%ld,%ld,%ld",
         context, candidates.size(), selection, caret.left, caret.top, caret.right, caret.bottom);
@@ -833,15 +896,33 @@ bool TextService::UpdateCandidates(ITfContext* context, const std::string& respo
         HideCandidates();
         return true;
     }
-    if (!CandidateWindow::Show(WideCandidates(candidates), selection, caret)) {
-        NativeLog::Write("UpdateCandidates -> CandidateWindow::Show failed");
-        return false;
+        std::lock_guard<std::mutex> callLock(callCoreMutex_);
+    if (!pipe_.IsConnected() && !pipe_.ConnectToServer(kPipeName, 50)) return false;
+    const unsigned int id = nextRequestId_++;
+    const HWND foreground = GetForegroundWindow();
+    UINT dpi = foreground ? GetDpiForWindow(foreground) : 0;
+    if (!dpi) dpi = GetDpiForSystem();
+    if (!dpi) dpi = 96;
+    std::string request = "{\"id\":" + std::to_string(id) + ",\"session\":" + std::to_string(sessionId_)
+        + ",\"type\":\"showCandidates\",\"candidates\":[";
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (i) request += ",";
+        request += "\"" + JsonEscape(candidates[i]) + "\"";
     }
+    request += "],\"selection\":" + std::to_string(selection)
+        + ",\"caret\":{\"left\":" + std::to_string(caret.left)
+        + ",\"top\":" + std::to_string(caret.top) + ",\"right\":" + std::to_string(caret.right)
+        + ",\"bottom\":" + std::to_string(caret.bottom) + "},\"dpi\":" + std::to_string(dpi) + "}";
+    if (!pipe_.Notify(request)) NativeLog::Write("UpdateCandidates Notify failed");
     return true;
 }
 
 void TextService::HideCandidates() {
-    CandidateWindow::Hide();
+    std::lock_guard<std::mutex> callLock(callCoreMutex_);
+    if (!pipe_.IsConnected() && !pipe_.ConnectToServer(kPipeName, 50)) return;
+    const unsigned int id = nextRequestId_++;
+    const std::string request = "{\"id\":" + std::to_string(id) + ",\"session\":" + std::to_string(sessionId_) + ",\"type\":\"hideCandidates\"}";
+    pipe_.Notify(request);
 }
 
 void TextService::OnCompositionTerminated() {

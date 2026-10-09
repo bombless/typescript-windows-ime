@@ -101,7 +101,7 @@ try {
     $hostExe = Join-Path $out "TypeScriptWindowsImeHost.exe"
     $stagedHost = Join-Path $staging "TypeScriptWindowsImeHost.exe"
     Remove-Item $stagedHost -Force -ErrorAction SilentlyContinue
-    cl.exe /nologo /std:c++17 /EHsc /W4 TypeScriptWindowsImeHost.cpp /Fe:"$stagedHost"
+    cl.exe /nologo /std:c++17 /EHsc /W4 TypeScriptWindowsImeHost.cpp "$out\CandidateWindow.obj" /Fe:"$stagedHost" /link user32.lib gdi32.lib advapi32.lib
     if ($LASTEXITCODE -eq 0) {
         try {
             Move-Item $stagedHost $hostExe -Force
@@ -120,7 +120,7 @@ try {
     $stagedExp = Join-Path $staging "TypeScriptWindowsIme.exp"
 
     Remove-Item $stagedDll, $stagedLib, $stagedExp -Force -ErrorAction SilentlyContinue
-    cl.exe /nologo /std:c++17 /EHsc /W4 /LD TsIme.cpp "$out\CandidateWindow.obj" "$out\PipeBridge.obj" /link /OUT:"$stagedDll" /IMPLIB:"$stagedLib" /DEF:"TsIme.def" /SUBSYSTEM:WINDOWS advapi32.lib ole32.lib oleaut32.lib user32.lib gdi32.lib
+    cl.exe /nologo /std:c++17 /EHsc /W4 /LD TsIme.cpp "$out\PipeBridge.obj" /link /OUT:"$stagedDll" /IMPLIB:"$stagedLib" /DEF:"TsIme.def" /SUBSYSTEM:WINDOWS advapi32.lib ole32.lib oleaut32.lib user32.lib gdi32.lib
     if ($LASTEXITCODE -ne 0) { throw "Failed to link TypeScriptWindowsIme.dll." }
 
     try {

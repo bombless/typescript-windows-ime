@@ -6,6 +6,13 @@ describe("JSONL protocol", () => {
     const message = { id: 2, session: 7, type: "keyDown" as const, vk: 65, scanCode: 30, key: "A", modifiers: 0 };
     expect(decodeRequestLine(encodeMessage(message).trim())).toEqual(message);
   });
+  it("round-trips candidate rendering notifications", () => {
+    const show = { id: 5, session: 7, type: "showCandidates" as const, candidates: ["你好", "世界"], selection: 1,
+      caret: { left: 10, top: 20, right: 11, bottom: 40 }, dpi: 144 };
+    expect(decodeRequestLine(encodeMessage(show).trim())).toEqual(show);
+    const hide = { id: 6, session: 7, type: "hideCandidates" as const };
+    expect(decodeRequestLine(encodeMessage(hide).trim())).toEqual(hide);
+  });
   it("round-trips a query with Unicode and empty composition", () => {
     const unicode = { id: 3, session: 7, type: "query" as const, composition: "你好" };
     expect(decodeRequestLine(encodeMessage(unicode).trim())).toEqual(unicode);

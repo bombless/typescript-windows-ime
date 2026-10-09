@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 export const MAX_MESSAGE_BYTES = 16 * 1024;
 
 // Every message carries the session that owns it. TSF activates one text
@@ -17,7 +17,12 @@ export interface KeyMessage extends SessionScoped {
   id: number; type: "keyDown" | "keyUp"; vk: number; scanCode: number; key: string; modifiers: number;
 }
 export interface ResetMessage extends SessionScoped { id: number; type: "reset"; }
-export type RequestMessage = HelloMessage | QueryMessage | TestKeyMessage | KeyMessage | ResetMessage;
+export interface ShowCandidatesMessage extends SessionScoped {
+  id: number; type: "showCandidates"; candidates: string[]; selection: number;
+  caret: { left: number; top: number; right: number; bottom: number }; dpi: number;
+}
+export interface HideCandidatesMessage extends SessionScoped { id: number; type: "hideCandidates"; }
+export type RequestMessage = HelloMessage | QueryMessage | TestKeyMessage | KeyMessage | ResetMessage | ShowCandidatesMessage | HideCandidatesMessage;
 export interface Candidate { text: string; index: number; annotation?: string; }
 export interface ResponseMessage extends SessionScoped {
   id: number; consume: boolean; composition?: string; commit?: string;
@@ -37,7 +42,14 @@ export function isRequestMessage(value: unknown): value is RequestMessage {
     return Number.isInteger(message.vk) && Number.isInteger(message.scanCode)
       && typeof message.key === "string" && typeof message.modifiers === "number";
   }
-  if (message.type === "reset") return true;
+  if (message.type === "reset" || message.type === "hideCandidates") return true;
+  if (message.type === "showCandidates") {
+    const caret = message.caret as Record<string, unknown> | undefined;
+    return Array.isArray(message.candidates) && message.candidates.every((candidate) => typeof candidate === "string")
+      && Number.isSafeInteger(message.selection) && (message.selection as number) >= 0
+      && Number.isSafeInteger(message.dpi) && (message.dpi as number) > 0
+      && !!caret && ["left", "top", "right", "bottom"].every((key) => Number.isFinite(caret[key]));
+  }
   if (message.type === "keyDown" || message.type === "keyUp") {
     return Number.isInteger(message.vk) && Number.isInteger(message.scanCode)
       && typeof message.key === "string" && typeof message.modifiers === "number";

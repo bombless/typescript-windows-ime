@@ -51,6 +51,9 @@ function handleMessage(
       return { response: { id: message.id, session, consume: engine.testKey(message, state).consume }, state };
     case "reset":
       return { response: { id: message.id, session, consume: false, composition: "" }, state: initialImeState() };
+    case "showCandidates":
+    case "hideCandidates":
+      return { response: { id: message.id, session, consume: false }, state };
     case "keyDown":
     case "keyUp":
       return engine.processKey(message, state);

@@ -272,8 +272,6 @@ void RunFieldReport() {
     const LONG y = work.top + (work.bottom - work.top) / 2 - 120;
     Say("showing the list near %ld,%ld for 10 seconds; look at the screen\n", x, y);
     Say("move nothing and do not click while this runs\n");
-
-    CandidateWindow::SetCaretProvider(nullptr);
     CandidateWindow::Show(MakeCandidates(5), 0, RECT{ x, y, x + 8, y + 20 });
 
     for (int second = 0; second < 10; ++second) {
@@ -481,7 +479,6 @@ void RunPixelProvenance() {
 
     for (int index = 0; index < 5; ++index) {
         SetEnvironmentVariableW(L"TSWIME_PAINT_STAGE", stages[index]);
-        CandidateWindow::SetCaretProvider(nullptr);
         CandidateWindow::Show(MakeCandidates(5), 0, RECT{ x, y, x + 8, y + 20 });
         WaitForPresentation(8);
 
@@ -547,8 +544,6 @@ void RunPresentTiming() {
     RECT work = PrimaryWorkArea();
     const LONG x = work.left + (work.right - work.left) / 2 - 80;
     const LONG y = work.top + (work.bottom - work.top) / 2 - 100;
-
-    CandidateWindow::SetCaretProvider(nullptr);
     CandidateWindow::Show(MakeCandidates(5), 0, RECT{ x, y, x + 8, y + 20 });
     HWND window = FindCandidateWindow();
     if (!window) {
@@ -625,8 +620,6 @@ void RunShowSequence() {
     const LONG x = work.left + (work.right - work.left) / 2 - 80;
     const LONG y = work.top + (work.bottom - work.top) / 2 - 100;
     const RECT area{ x, y + 22, x + 176, y + 22 + 269 };
-
-    CandidateWindow::SetCaretProvider(nullptr);
     CandidateWindow::Show(MakeCandidates(5), 0, RECT{ x, y, x + 8, y + 20 });
     HWND window = FindCandidateWindow();
     if (!window) {
@@ -680,7 +673,6 @@ void RunStyleVariants() {
     // The real window goes first, at the same coordinates, so the two are
     // directly comparable. If the real one is missing where the baseline shows,
     // the difference is inside CandidateWindow and not in the environment.
-    CandidateWindow::SetCaretProvider(nullptr);
     CandidateWindow::Show(MakeCandidates(5), 0, RECT{ x, y - 20, x + 8, y });
     Say("  --- real CandidateWindow at the same spot ---\n");
     VerifyOnScreen("real-at-variant-spot", true);
@@ -945,7 +937,6 @@ SayProcessImage(topProcess, "coversWindow");
 void ScenarioLoggedCaret(size_t count) {
     Say("  using the caret from the native log: 534,638,552,709\n");
     RECT caret{ 534, 638, 552, 709 };
-    CandidateWindow::SetCaretProvider(nullptr);
     CandidateWindow::Show(MakeCandidates(count), 0, caret);
     Pump(400);
     HWND window = FindCandidateWindow();
@@ -1023,26 +1014,17 @@ int CountRowsFromCapture(const Capture& capture) {
     return rows;
 }
 
-bool g_retryCaretReady = false;
-bool RetryCaretProvider(RECT& caret) {
-    if (!g_retryCaretReady) return false;
-    RECT work = PrimaryWorkArea();
-    caret = RECT{ work.left + 400, work.top + 300, work.left + 408, work.top + 320 };
-    return true;
-}
 
 void ScenarioCaretRetry(size_t count) {
     RECT empty{};
     (void)count;
-    g_retryCaretReady = false;
-    CandidateWindow::SetCaretProvider(&RetryCaretProvider);
-    Say("  caret provider returns nothing yet\n");
+    Say("  show with no caret, then explicitly resend with a resolved caret\n");
     CandidateWindow::Show(MakeCandidates(count), 0, empty);
     VerifyOnScreen("retry-initial", true);
-    g_retryCaretReady = true;
-    Say("  caret provider now returns a rectangle; waiting for the retry timer\n");
+    RECT work = PrimaryWorkArea();
+    RECT caret{ work.left + 400, work.top + 300, work.left + 408, work.top + 320 };
+    CandidateWindow::Show(MakeCandidates(count), 0, caret);
     VerifyOnScreen("retry-moved", true);
-    CandidateWindow::SetCaretProvider(nullptr);
     CandidateWindow::Hide();
 }
 
@@ -1091,7 +1073,6 @@ void ScenarioUnawareHost() {
     g_previousAwareness = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
     Say("  host reports a logical caret %ld,%ld,%ld,%ld while the thread is DPI unaware\n",
         logicalCaret.left, logicalCaret.top, logicalCaret.right, logicalCaret.bottom);
-    CandidateWindow::SetCaretProvider(nullptr);
     CandidateWindow::Show(MakeCandidates(9), 0, logicalCaret);
     Pump(500);
 
@@ -1311,7 +1292,6 @@ int wmain(int argc, wchar_t** argv) {
 
     if (haveCaret) {
         Say("caret=%ld,%ld,%ld,%ld\n", caret.left, caret.top, caret.right, caret.bottom);
-        CandidateWindow::SetCaretProvider(nullptr);
         CandidateWindow::Show(MakeCandidates(count), 0, caret);
         VerifyOnScreen("explicit-caret", true);
         // Leave the list on screen briefly so it can be inspected by hand.

@@ -286,6 +286,7 @@ bool PipeBridge::Call(
     std::string& responseJson,
     unsigned int requestId) {
 
+    std::lock_guard<std::mutex> callLock(callCoreMutex_);
     HANDLE pipe = INVALID_HANDLE_VALUE;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -329,4 +330,19 @@ bool PipeBridge::Call(
     responseJson = std::move(response);
     NativeLog::Write("PipeBridge::Call success id=%u responseBytes=%zu", requestId, responseJson.size());
     return true;
+}
+
+bool PipeBridge::Notify(const std::string& requestJson) {
+    std::lock_guard<std::mutex> callLock(callCoreMutex_);
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pipe = pipe_;
+    }
+    if (pipe == INVALID_HANDLE_VALUE || requestJson.size() > kBufferSize - 1) return false;
+    const std::string framed = requestJson + "\n";
+    if (WriteAll(pipe, framed.data(), static_cast<DWORD>(framed.size()))) return true;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pipe_ == pipe) DisconnectLocked();
+    return false;
 }

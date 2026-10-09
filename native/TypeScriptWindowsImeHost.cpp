@@ -2,6 +2,7 @@
 #include <aclapi.h>
 #include <sddl.h>
 #include "NativeLog.h"
+#include "CandidateWindow.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -34,6 +35,8 @@ HANDLE g_nodeClient = INVALID_HANDLE_VALUE;
 // the session id inside each JSONL line, never by arrival order: displacing the
 // previous client would hand its responses to the wrong application.
 std::map<unsigned long long, HANDLE> g_tsfClients;
+unsigned long long g_renderOwnerSession = 0;
+std::mutex g_renderMutex;
 
 // Every session thread writes to the one Node pipe, so those writes need a lock
 // to stay line-atomic.
@@ -164,6 +167,82 @@ bool ReadSessionId(const std::string& line, unsigned long long& session) {
     return true;
 }
 
+unsigned int JsonUInt(const std::string& line, const char* key, unsigned int fallback = 0) {
+    const std::string needle = std::string("\"") + key + "\":";
+    const size_t pos = line.find(needle);
+    if (pos == std::string::npos) return fallback;
+    size_t begin = pos + needle.size(), end = begin;
+    while (end < line.size() && line[end] >= '0' && line[end] <= '9') ++end;
+    if (end == begin) return fallback;
+    try { return static_cast<unsigned int>(std::stoul(line.substr(begin, end - begin))); }
+    catch (...) { return fallback; }
+}
+
+LONG JsonLong(const std::string& line, const char* key, LONG fallback = 0) {
+    const std::string needle = std::string("\"") + key + "\":";
+    const size_t pos = line.find(needle);
+    if (pos == std::string::npos) return fallback;
+    const size_t begin = pos + needle.size();
+    try { return static_cast<LONG>(std::stol(line.substr(begin))); }
+    catch (...) { return fallback; }
+}
+
+bool JsonRect(const std::string& line, RECT& rect) {
+    const size_t start = line.find("\"caret\":{");
+    if (start == std::string::npos) return false;
+    const std::string fields = line.substr(start);
+    rect.left = JsonLong(fields, "left", 0);
+    rect.top = JsonLong(fields, "top", 0);
+    rect.right = JsonLong(fields, "right", 0);
+    rect.bottom = JsonLong(fields, "bottom", 0);
+    return true;
+}
+
+std::vector<std::wstring> JsonStringArray(const std::string& line) {
+    std::vector<std::wstring> result;
+    const size_t start = line.find("\"candidates\":[");
+    if (start == std::string::npos) return result;
+    size_t i = start + 14;
+    while (i < line.size() && line[i] != ']') {
+        if (line[i] == ',' || line[i] == ' ' || line[i] == '\r' || line[i] == '\n') { ++i; continue; }
+        if (line[i++] != '"') return {};
+        std::string value;
+        while (i < line.size() && line[i] != '"') {
+            char c = line[i++];
+            if (c == '\\' && i < line.size()) {
+                const char escaped = line[i++];
+                switch (escaped) {
+                case 'n': value += '\n'; break; case 'r': value += '\r'; break;
+                case 't': value += '\t'; break; case '\\': value += '\\'; break;
+                case '"': value += '"'; break; default: value += escaped; break;
+                }
+            } else value += c;
+        }
+        if (i >= line.size()) return {};
+        ++i;
+        const int chars = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+        std::wstring wide(static_cast<size_t>(chars), L'\0');
+        if (chars) MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), wide.data(), chars);
+        result.push_back(std::move(wide));
+    }
+    return result;
+}
+
+bool HandleCandidateNotification(const std::string& line, unsigned long long session) {
+    const bool show = line.find("\"type\":\"showCandidates\"") != std::string::npos;
+    const bool hide = line.find("\"type\":\"hideCandidates\"") != std::string::npos;
+    if (!show && !hide) return false;
+    std::lock_guard<std::mutex> renderLock(g_renderMutex);
+    if (hide) {
+        if (g_renderOwnerSession == session) { CandidateWindow::Hide(); g_renderOwnerSession = 0; }
+        return true;
+    }
+    RECT caret{};
+    JsonRect(line, caret);
+    g_renderOwnerSession = session;
+    CandidateWindow::Show(JsonStringArray(line), JsonUInt(line, "selection", 0), caret, JsonUInt(line, "dpi", 96));
+    return true;
+}
 // A named pipe has a single owner, so a second Host silently breaks the first:
 // both processes accept connections and each believes it owns the relay.
 bool PipeIsOwned(const wchar_t* name) {
@@ -275,6 +354,8 @@ void ServeTsfClient(HANDLE pipe) {
                 session, pipe, g_tsfClients.size());
         }
 
+        if (HandleCandidateNotification(line, session)) continue;
+
         HANDLE node = INVALID_HANDLE_VALUE;
         {
             std::lock_guard<std::mutex> lock(g_clientsMutex);
@@ -296,6 +377,8 @@ void ServeTsfClient(HANDLE pipe) {
         auto current = g_tsfClients.find(session);
         if (current != g_tsfClients.end() && current->second == pipe) {
             g_tsfClients.erase(current);
+            std::lock_guard<std::mutex> renderLock(g_renderMutex);
+            if (g_renderOwnerSession == session) { CandidateWindow::Hide(); g_renderOwnerSession = 0; }
             NativeLog::Write("Host TSF session closed session=%llu clients=%zu", session, g_tsfClients.size());
         }
     }
