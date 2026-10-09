@@ -60,8 +60,8 @@ function UnregisterDll([string]$dll) {
 }
 
 function Stop-HostProcess {
-    Write-Host "Stopping npm run host and the native TSF relay..."
-    Get-Process -Name "TypeScriptWindowsImeHost" -ErrorAction SilentlyContinue |
+    Write-Host "Stopping npm run host, the native TSF relay, and PipeBridgeTest..."
+    Get-Process -Name "TypeScriptWindowsImeHost", "PipeBridgeTest" -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
 
     $projectPattern = [regex]::Escape($projectRoot)

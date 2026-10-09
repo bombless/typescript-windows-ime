@@ -313,8 +313,15 @@ bool PipeBridge::Call(
         return false;
     }
 
+    // Compare the id field exactly. A substring search would accept a response
+    // for request 1 as the answer to request 10, because "\"id\":1" is a prefix
+    // of "\"id\":10".
     const std::string needle = "\"id\":" + std::to_string(requestId);
-    if (response.find(needle) == std::string::npos) {
+    const size_t found = response.find(needle);
+    const bool exact = found != std::string::npos &&
+        (found + needle.size() == response.size() || response[found + needle.size()] == ',' ||
+            response[found + needle.size()] == '}');
+    if (!exact) {
         NativeLog::Write("PipeBridge::Call response id mismatch expected=%u responseBytes=%zu", requestId, response.size());
         return false;
     }

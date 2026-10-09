@@ -21,10 +21,12 @@ export class SimpleEngine implements ImeEngine {
       : getCandidates(result.state.composition);
     const response: ResponseMessage = {
       id: event.id,
+      session: event.session,
       consume: result.consume,
       composition: result.state.composition,
       candidates,
-      ...(result.commit !== undefined ? { commit: candidates[0]?.text ?? result.commit } : {}),
+      selectedCandidate: result.state.selectedCandidate,
+      ...(result.commit !== undefined ? { commit: result.commit } : {}),
     };
     return { state: result.state, response };
   }

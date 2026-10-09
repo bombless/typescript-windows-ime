@@ -5,6 +5,8 @@
 #include "NativeLog.h"
 
 #include <new>
+#include <atomic>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -21,6 +23,41 @@ constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf";
 // The candidate window asks for the caret rectangle from a timer, so the
 // service that owns the current composition has to be reachable from there.
 TextService* g_activeService = nullptr;
+// TSF activates one text service per application process and the Host
+// multiplexes every one of them over a single Node connection. Request ids
+// restart at 1 in each process, so they cannot identify a request on their
+// own. A session id that is unique per process lets the Host route each
+// response back to the client that asked, and lets Node keep one composition
+// per application instead of one shared composition.
+std::atomic<unsigned long long> g_nextSessionId{1};
+unsigned long long AllocateSessionId() {
+    const unsigned long long processId = GetCurrentProcessId();
+    // The low bits hold a per-process counter, the high bits the pid. Shifting
+    // the pid up keeps the value inside the safe-integer range Node validates.
+    const unsigned long long counter = g_nextSessionId.fetch_add(1) - 1;
+    return (processId << 20) | (counter & 0xfffff);
+}
+void LogForegroundContext(const char* where, ITfContext* context) {
+    const HWND foreground = GetForegroundWindow();
+    DWORD pid = 0;
+    if (foreground) GetWindowThreadProcessId(foreground, &pid);
+    wchar_t image[MAX_PATH]{};
+    HANDLE process = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr;
+    DWORD imageLength = ARRAYSIZE(image);
+    if (process) {
+        QueryFullProcessImageNameW(process, 0, image, &imageLength);
+        CloseHandle(process);
+    }
+    wchar_t className[128]{};
+    if (foreground) GetClassNameW(foreground, className, ARRAYSIZE(className));
+    char imageUtf8[MAX_PATH * 3]{};
+    char classUtf8[384]{};
+    WideCharToMultiByte(CP_UTF8, 0, image, -1, imageUtf8, sizeof(imageUtf8), nullptr, nullptr);
+    WideCharToMultiByte(CP_UTF8, 0, className, -1, classUtf8, sizeof(classUtf8), nullptr, nullptr);
+    NativeLog::Write("AppContext where=%s hwnd=%p pid=%lu image=%s class=%s context=%p",
+        where, foreground, static_cast<unsigned long>(pid),
+        imageUtf8[0] ? imageUtf8 : "<unknown>", classUtf8[0] ? classUtf8 : "<unknown>", context);
+}
 bool ReadCaretRectFromService(RECT& caret);
 
 std::string JsonEscape(const std::string& value) {
@@ -441,7 +478,8 @@ class TextService final : public ITfTextInputProcessor {
 public:
 TextService()
         : refCount_(1), threadMgr_(nullptr), keyMgr_(nullptr), keySink_(nullptr),
-          clientId_(TF_CLIENTID_NULL), keySinkAdvised_(false), nextRequestId_(1), pipe_(250), compositionContext_(nullptr),
+          clientId_(TF_CLIENTID_NULL), keySinkAdvised_(false), nextRequestId_(1),
+          sessionId_(AllocateSessionId()), pipe_(250), compositionContext_(nullptr),
           compositionText_() {
         InterlockedIncrement(&g_objectCount);
     }
@@ -576,6 +614,10 @@ bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
     TfClientId clientId_;
     bool keySinkAdvised_;
     unsigned int nextRequestId_;
+    // Identifies this text service across the shared Host connection.
+    unsigned long long sessionId_;
+    // Serialize key callbacks so request IDs and pipe responses cannot race.
+    std::mutex callCoreMutex_;
     PipeBridge pipe_;
     ITfContext* compositionContext_;
     std::string compositionText_;
@@ -584,6 +626,7 @@ bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
 };
 
 HRESULT KeyEventSink::OnSetFocus(BOOL foreground) {
+    LogForegroundContext("OnSetFocus", nullptr);
     NativeLog::Write("OnSetFocus service=%p foreground=%d", service_, foreground ? 1 : 0);
     service_->LogActiveProfile(foreground ? "OnSetFocus-foreground" : "OnSetFocus-background");
     return S_OK;
@@ -606,7 +649,12 @@ std::string TextService::KeyName(WPARAM vk) {
     case VK_ESCAPE: return "Escape";
     case VK_RETURN: return "Enter";
     case VK_SPACE: return " ";
+    case VK_LEFT: return "ArrowLeft";
+    case VK_UP: return "ArrowUp";
+    case VK_RIGHT: return "ArrowRight";
+    case VK_DOWN: return "ArrowDown";
     default:
+        if (vk >= '1' && vk <= '9') return std::string(1, static_cast<char>(vk));
         if (vk >= 'A' && vk <= 'Z') return std::string(1, static_cast<char>(vk));
         if (vk >= 'a' && vk <= 'z') return std::string(1, static_cast<char>(vk));
         return {};
@@ -646,6 +694,7 @@ int TextService::Modifiers() {
 
 bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
                            std::string& response) {
+    std::lock_guard<std::mutex> callLock(callCoreMutex_);
     consume = false;
     const std::string key = KeyName(vk);
     if (key.empty()) {
@@ -662,14 +711,15 @@ bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bo
     const unsigned int scanCode = (static_cast<unsigned int>(lParam) >> 16) & 0xff;
     const std::string request =
         std::string("{\"id\":") + std::to_string(id) +
+        ",\"session\":" + std::to_string(sessionId_) +
         ",\"type\":\"" + type +
         "\",\"vk\":" + std::to_string(static_cast<unsigned int>(vk)) +
         ",\"scanCode\":" + std::to_string(scanCode) +
         ",\"key\":\"" + JsonEscape(key) +
         "\",\"modifiers\":" + std::to_string(Modifiers()) + "}";
 
-    NativeLog::Write("CallCore request id=%u type=%s vk=0x%02X key=%s modifiers=%d",
-        id, type.c_str(), static_cast<unsigned int>(vk), key.c_str(), Modifiers());
+    NativeLog::Write("CallCore request id=%u session=%llu type=%s vk=0x%02X key=%s modifiers=%d",
+        id, sessionId_, type.c_str(), static_cast<unsigned int>(vk), key.c_str(), Modifiers());
     if (!pipe_.Call(request, response, id)) {
         NativeLog::Write("CallCore response id=%u failed", id);
         pipe_.Disconnect();
@@ -711,6 +761,7 @@ bool TextService::HandleKey(ITfContext* context, WPARAM wParam, LPARAM lParam, b
 }
 
 bool TextService::ApplyResponse(ITfContext* context, const std::string& response) {
+    LogForegroundContext("ApplyResponse", context);
     const std::string composition = JsonString(response, "composition");
     const std::string commit = JsonString(response, "commit");
     const bool hasCommit = response.find("\"commit\":") != std::string::npos;
@@ -762,6 +813,7 @@ if (hasCommit || composition.empty()) {
 }
 
 bool TextService::UpdateCandidates(ITfContext* context, const std::string& response, RECT caret) {
+    LogForegroundContext("UpdateCandidates", context);
     const std::vector<std::string> candidates = JsonCandidateTexts(response);
     const UINT selection = JsonUInt(response, "selectedCandidate", 0);
     // Keep the last known anchor: an application can report no layout right
@@ -831,6 +883,7 @@ HRESULT CompositionSink::OnCompositionTerminated(TfEditCookie, ITfComposition*) 
 }
 
 HRESULT KeyEventSink::OnTestKeyDown(ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
+    LogForegroundContext("OnTestKeyDown", context);
     if (!eaten) return E_POINTER;
     bool consume = false;
     const bool ok = service_->TestKey(context, wParam, lParam, consume);
@@ -847,6 +900,7 @@ HRESULT KeyEventSink::OnTestKeyUp(ITfContext*, WPARAM, LPARAM, BOOL* eaten) {
 }
 
 HRESULT KeyEventSink::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
+    LogForegroundContext("OnKeyDown", context);
     if (!eaten) return E_POINTER;
     bool consume = false;
     const bool ok = service_->HandleKey(context, wParam, lParam, consume);
