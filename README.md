@@ -58,26 +58,26 @@ recorded process tree with `taskkill /T /F` before listening, and releases the
 lock on shutdown. `npm run dev` retries for five seconds when the pipe is still
 busy and then exits with an explicit message instead of hanging.
 
-## Minimal TSF registration skeleton
+## Native TSF build and installation
 
-The native layer now contains a minimal keyboard TIP COM server. It implements `IClassFactory` and `ITfTextInputProcessor`, registers a stable development CLSID/profile, registers `GUID_TFCAT_TIP_KEYBOARD`, and exposes the standard COM self-registration exports. It does not handle key events yet.
+The native layer contains a keyboard TIP COM server and the named-pipe Host. Build the native DLL, Host, and diagnostic/test programs with:
 
-Build the native DLL:
+
 
 ```powershell
 .\\native\\build.ps1
 ```
 
-Register it from an **elevated 64-bit PowerShell**:
+Install or update the TSF DLL from PowerShell; the script requests elevation when needed, installs a versioned DLL, and verifies the registration:
 
 ```powershell
-.\\native\\register.ps1
+.\\native\\install-user.ps1
 ```
 
-The matching uninstall command is:
+Start or update the native pipe Host with:
 
 ```powershell
-.\\native\\unregister.ps1
+npm run host
 ```
 
-The profile is registered with LANGID `0xFFFF` (all languages); Windows Settings will only surface it where the corresponding language/profile can be used. This skeleton is intentionally separate from the PipeBridge and does not yet connect TSF key events to Node.js.
+If a stale TSF/COM process holds the DLL or registration needs recovery, run `.\\native\\cleanup-com.ps1` before rebuilding. It stops relevant host processes and removes the COM/TSF registration; by default it leaves `ctfmon` stopped so the DLL can be replaced. After rebuilding, run `.\native\install-user.ps1` to register the new DLL. The old `install.ps1`, `register.ps1`, and `unregister.ps1` entry points have been removed in favor of this version-aware workflow.
