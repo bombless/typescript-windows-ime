@@ -4,3 +4,7 @@ dist/
 /native/build
 /native/install
 *.obj
+
+# Generated artifacts for the Go TSF binding prototype
+/native/golang/strategy-generated-bindings/build/
+/native/golang/strategy-generated-bindings/install/
