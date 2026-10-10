@@ -8,3 +8,8 @@ dist/
 # Generated artifacts for the Go TSF binding prototype
 /native/golang/strategy-generated-bindings/build/
 /native/golang/strategy-generated-bindings/install/
+
+# Build output of the Go TIP package itself (c-shared builds land here when -o is omitted)
+/native/golang/strategy-generated-bindings/tip.exe
+/native/golang/strategy-generated-bindings/tip/tip
+/native/golang/strategy-generated-bindings/tip/tip.h
