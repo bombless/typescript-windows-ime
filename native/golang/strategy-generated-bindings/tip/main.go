@@ -909,6 +909,10 @@ type tipImpl struct {
 	// from the application's thread while another application types. This
 	// mirrors callCoreMutex_ in native/TsIme.cpp.
 	keyMu sync.Mutex
+	// Body of the showCandidates notification the Host is currently drawing,
+	// so focus returning to this application can re-send the same list. Empty
+	// means nothing is on the Host's screen for this session.
+	shownCandidates atomic.Value // string
 	// *ITfComposition of the composition on screen, plus the context it lives
 	// in. 0 means there is none.
 	composition           atomic.Uintptr
@@ -973,6 +977,9 @@ func (t *tipImpl) Deactivate() win32.HRESULT {
 	t.dropComposition()
 	t.compositionContext.Store(0)
 	t.compositionText.Store("")
+	// The remembered list belongs to a composition that no longer exists, so a
+	// later activation must not restore it on focus.
+	t.shownCandidates.Store("")
 	generation := pipeGeneration.Add(1)
 	strategyLog("StrategyTip deactivate generation=%d", generation)
 	stopPipe()
@@ -1226,7 +1233,18 @@ func eat(callback string, pfEaten uintptr, eaten bool) {
 
 func keySinkOnSetFocus(this uintptr, foreground uintptr) uintptr {
 	return guardedCall("ITfKeyEventSink.OnSetFocus", func() uintptr {
+		service := (*keySinkComObj)(unsafe.Pointer(this)).Impl().(*tipImpl)
 		strategyLog("TSF OnSetFocus foreground=%v pid=%d", foreground != 0, os.Getpid())
+		// The Host draws the list on a topmost window of its own, so it does
+		// not follow the caret: TSF reports the focus move here and the list
+		// has to go while another application owns the text. Coming back puts
+		// it back while the composition is still alive, exactly like the C++
+		// service.
+		if foreground != 0 {
+			service.restoreCandidates()
+		} else {
+			sendNotify("hideCandidates", "")
+		}
 		return hresultToUintptr(int32(win32.S_OK))
 	})
 }
@@ -1274,7 +1292,7 @@ func keySinkOnKeyDown(this uintptr, context uintptr, key uintptr, lParam uintptr
 		if context != 0 {
 			if consume {
 				caret := service.applyComposition(context, reply)
-				notifyCandidates(reply, caret)
+				service.notifyCandidates(reply, caret)
 			} else {
 				service.forgetComposition(context)
 			}

@@ -85,11 +85,14 @@ if ($LASTEXITCODE -ne 0) { throw "TSF registration verification failed. Language
 # Windows uses the per-user Enable flag when deciding whether a TIP can be
 # activated for the current language. Add it for every profile we register;
 # without this value the IME can appear in the list but fail to switch on.
-foreach ($langid in @("00000409", "00000804", "00000411")) {
+foreach ($langid in @("00000409", "00000411")) {
     $userProfileKey = "HKCU\Software\Microsoft\CTF\TIP\$clsid\LanguageProfile\0x$langid\$profile"
-    & $reg add $userProfileKey /v Enable /t REG_DWORD /d 1 /f | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Per-user TSF profile enable failed: $userProfileKey" }
+    & $reg delete $userProfileKey /f 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Verbose "No legacy per-user profile to remove: $userProfileKey" }
 }
+$userZhProfileKey = "HKCU\Software\Microsoft\CTF\TIP\$clsid\LanguageProfile\0x00000804\$profile"
+& $reg add $userZhProfileKey /v Enable /t REG_DWORD /d 1 /f | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Per-user zh-CN TSF profile enable failed: $userZhProfileKey" }
 
 Write-Host "Installed and verified:"
 Write-Host "  CLSID:   $clsid"

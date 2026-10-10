@@ -517,15 +517,15 @@ func (t *tipImpl) forgetComposition(context uintptr) {
 	}
 }
 
-// notifyCandidates tells the Host to draw or hide the candidate list. The Host
-// consumes these itself and never answers them.
-func notifyCandidates(reply string, caret [4]int32) {
+// candidatesPayload encodes the showCandidates body for one reply and caret.
+// An empty string means the list has to be hidden instead: no candidates, a
+// commit, or an empty composition.
+func candidatesPayload(reply string, caret [4]int32) string {
 	candidates := replyCandidates(reply)
 	composition := replyString(reply, "composition")
 	hasCommit := replyHas(reply, "commit")
 	if len(candidates) == 0 || hasCommit || composition == "" {
-		sendNotify("hideCandidates", "")
-		return
+		return ""
 	}
 	var list strings.Builder
 	for i, candidate := range candidates {
@@ -536,9 +536,38 @@ func notifyCandidates(reply string, caret [4]int32) {
 		list.WriteString(jsonEscape(candidate))
 		list.WriteByte('"')
 	}
-	payload := fmt.Sprintf(`,"candidates":[%s],"selection":%d,"caret":{"left":%d,"top":%d,"right":%d,"bottom":%d},"dpi":%d`,
+	return fmt.Sprintf(`,"candidates":[%s],"selection":%d,"caret":{"left":%d,"top":%d,"right":%d,"bottom":%d},"dpi":%d`,
 		list.String(), replyUint(reply, "selectedCandidate"),
 		caret[0], caret[1], caret[2], caret[3], foregroundDpi())
+}
+
+// notifyCandidates tells the Host to draw or hide the candidate list. The Host
+// consumes these itself and never answers them. Whatever it draws is
+// remembered, so focus returning to this application can restore the same list.
+func (t *tipImpl) notifyCandidates(reply string, caret [4]int32) {
+	payload := candidatesPayload(reply, caret)
+	if payload == "" {
+		t.shownCandidates.Store("")
+		sendNotify("hideCandidates", "")
+		return
+	}
+	t.shownCandidates.Store(payload)
+	sendNotify("showCandidates", payload)
+}
+
+// restoreCandidates re-sends the remembered list. The Host draws it on a
+// topmost window of its own, so it does not follow the caret: switching away
+// hides it and only this can put it back. A composition that is no longer on
+// screen owns no list, so nothing is sent for one.
+func (t *tipImpl) restoreCandidates() {
+	if t.composition.Load() == 0 || t.compositionContext.Load() == 0 {
+		return
+	}
+	payload, _ := t.shownCandidates.Load().(string)
+	if payload == "" {
+		return
+	}
+	strategyLog("StrategyTip restoring candidates after focus")
 	sendNotify("showCandidates", payload)
 }
 

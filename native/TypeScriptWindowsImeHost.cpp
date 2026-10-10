@@ -18,12 +18,27 @@
 
 namespace {
 constexpr DWORD kBufferSize = 16 * 1024;
-constexpr wchar_t kNodePipe[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Host";
-constexpr wchar_t kTsfPipe[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf";
+constexpr wchar_t kNodePipeBase[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Host";
+constexpr wchar_t kTsfPipeBase[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf";
+
+// Test seam: a pipe suffix puts a second Host on private pipes so a test can
+// drive a Host of its own next to a running one without disturbing either. The
+// default names are unchanged, so a Host started normally is unaffected.
+std::wstring PipeName(const wchar_t* base) {
+    wchar_t suffix[64]{};
+    const DWORD length = GetEnvironmentVariableW(L"TypeScriptWindowsIMEPipeSuffix", suffix, ARRAYSIZE(suffix));
+    if (length == 0 || length >= ARRAYSIZE(suffix)) return base;
+    return std::wstring(base) + L"." + suffix;
+}
 
 std::atomic<bool> g_running{true};
 std::mutex g_clientsMutex;
 std::condition_variable g_clientsChanged;
+
+// Resolved once in wmain with the optional test suffix; every listener and the
+// startup ownership check use these.
+std::wstring g_nodePipeName;
+std::wstring g_tsfPipeName;
 
 // The Node business client. Exactly one may be connected: a newer one replaces
 // the older, which is told to exit by the broken pipe. Node keeps one IME state
@@ -167,6 +182,16 @@ bool ReadSessionId(const std::string& line, unsigned long long& session) {
     return true;
 }
 
+std::string MessageType(const std::string& line) {
+    const std::string needle = "\"type\":\"";
+    const size_t pos = line.find(needle);
+    if (pos == std::string::npos) return "?";
+    const size_t begin = pos + needle.size();
+    const size_t end = line.find('"', begin);
+    if (end == std::string::npos || end == begin) return "?";
+    return line.substr(begin, end - begin);
+}
+
 unsigned int JsonUInt(const std::string& line, const char* key, unsigned int fallback = 0) {
     const std::string needle = std::string("\"") + key + "\":";
     const size_t pos = line.find(needle);
@@ -253,7 +278,7 @@ bool PipeIsOwned(const wchar_t* name) {
 }
 
 bool ClaimExclusiveOwnership() {
-    for (const wchar_t* name : { kNodePipe, kTsfPipe }) {
+    for (const wchar_t* name : { g_nodePipeName.c_str(), g_tsfPipeName.c_str() }) {
         if (!PipeIsOwned(name)) continue;
         std::wcerr << L"Another TypeScriptWindowsImeHost already owns " << name << L"\r\n"
                    << L"Stop it first: Get-Process -Name 'TypeScriptWindowsImeHost*' | Stop-Process -Force"
@@ -318,6 +343,8 @@ HANDLE AcceptClient(const wchar_t* name, PendingConnect* pending) {
             if (!g_running) return INVALID_HANDLE_VALUE;
             continue;
         }
+
+        std::wcout << L"[HOST PIPE] Client connected: " << name << std::endl;
         return pipe;
     }
     return INVALID_HANDLE_VALUE;
@@ -347,6 +374,8 @@ void ServeTsfClient(HANDLE pipe) {
                     session, existing->second, pipe);
                 DisconnectNamedPipe(existing->second);
                 CloseHandle(existing->second);
+                NativeLog::WriteStdout("TSF pipe disconnected pipe=%p session=%llu reason=stale-replaced",
+                    existing->second, session);
             }
             g_tsfClients[session] = pipe;
             registered = true;
@@ -354,7 +383,15 @@ void ServeTsfClient(HANDLE pipe) {
                 session, pipe, g_tsfClients.size());
         }
 
-        if (HandleCandidateNotification(line, session)) continue;
+        NativeLog::Write("Host TSF request session=%llu type=%s bytes=%zu",
+            session, MessageType(line).c_str(), line.size());
+        const std::string type = MessageType(line);
+        if (type == "testKeyDown" || type == "keyDown" || type == "keyUp") {
+            std::cout << "[HOST KEY][session=" << session << "] type=" << type
+                      << " vk=0x" << std::hex << JsonUInt(line, "vk", 0)
+                      << " scanCode=0x" << JsonUInt(line, "scanCode", 0)
+                      << std::dec << std::endl;
+        }        if (HandleCandidateNotification(line, session)) continue;
 
         HANDLE node = INVALID_HANDLE_VALUE;
         {
@@ -373,23 +410,55 @@ void ServeTsfClient(HANDLE pipe) {
     }
 
     if (registered) {
-        std::lock_guard<std::mutex> lock(g_clientsMutex);
-        auto current = g_tsfClients.find(session);
-        if (current != g_tsfClients.end() && current->second == pipe) {
-            g_tsfClients.erase(current);
+        // The render lock is taken and released on its own, before the client
+        // map lock. Nesting them the other way round is what wedged the Host:
+        // whoever held g_renderMutex while blocked on a window could never
+        // release it, so this thread stopped at g_clientsMutex forever and the
+        // listener never reached ConnectNamedPipe again.
+        bool hideMine = false;
+        {
             std::lock_guard<std::mutex> renderLock(g_renderMutex);
-            if (g_renderOwnerSession == session) { CandidateWindow::Hide(); g_renderOwnerSession = 0; }
-            NativeLog::Write("Host TSF session closed session=%llu clients=%zu", session, g_tsfClients.size());
+            if (g_renderOwnerSession == session) {
+                hideMine = true;
+                g_renderOwnerSession = 0;
+            }
         }
+        {
+            std::lock_guard<std::mutex> lock(g_clientsMutex);
+            auto current = g_tsfClients.find(session);
+            if (current != g_tsfClients.end() && current->second == pipe) {
+                g_tsfClients.erase(current);
+                NativeLog::Write("Host TSF session closed session=%llu clients=%zu",
+                    session, g_tsfClients.size());
+            }
+        }
+        // Outside both locks: Hide is a request to the candidate window's own
+        // thread and must not be issued while holding either mutex.
+        if (hideMine) CandidateWindow::Hide();
+    } else {
+        // Accepted but never sent a line carrying a session id, so the client
+        // cannot be named. Without this the connection would vanish from the
+        // log and look like a listener that stopped accepting.
+        NativeLog::Write("Host TSF client disconnected before sending a session id pipe=%p", pipe);
     }
     CancelIoEx(pipe, nullptr);
     DisconnectNamedPipe(pipe);
     CloseHandle(pipe);
+    NativeLog::WriteStdout("TSF pipe disconnected pipe=%p session=%llu registered=%d",
+        pipe, session, registered ? 1 : 0);
 }
 
+// PIPE_UNLIMITED_INSTANCES: every input method connects here at the same time.
+// The Node pipe stays one client because one process owns the IME state.
 void ListenForTsfClients() {
     while (g_running) {
-        HANDLE client = AcceptClient(kTsfPipe, &g_tsfConnect);
+        size_t clients = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_clientsMutex);
+            clients = g_tsfClients.size();
+        }
+        NativeLog::Write("Host TSF listener waiting clients=%zu", clients);
+        HANDLE client = AcceptClient(g_tsfPipeName.c_str(), &g_tsfConnect);
         if (client == INVALID_HANDLE_VALUE) return;
         NativeLog::Write("Host accepted TSF client pipe=%p", client);
         std::lock_guard<std::mutex> lock(g_clientsMutex);
@@ -422,6 +491,7 @@ void DispatchNodeToTsf(HANDLE node) {
         }
     }
     NativeLog::Write("Host Node dispatch ended pipe=%p", node);
+    NativeLog::WriteStdout("Node pipe disconnected pipe=%p", node);
 }
 
 // Node replacement is the one place newest-wins is correct: only one business
@@ -429,7 +499,7 @@ void DispatchNodeToTsf(HANDLE node) {
 // it sees the broken pipe.
 void ListenForNodeClient() {
     while (g_running) {
-        HANDLE client = AcceptClient(kNodePipe, &g_nodeConnect);
+        HANDLE client = AcceptClient(g_nodePipeName.c_str(), &g_nodeConnect);
         if (client == INVALID_HANDLE_VALUE) return;
 
         HANDLE previous = INVALID_HANDLE_VALUE;
@@ -445,6 +515,7 @@ void ListenForNodeClient() {
         if (previous != INVALID_HANDLE_VALUE) {
             DisconnectNamedPipe(previous);
             CloseHandle(previous);
+            NativeLog::WriteStdout("Node pipe disconnected pipe=%p reason=replaced", previous);
         }
     }
 }
@@ -467,10 +538,13 @@ int wmain() {
     NativeLog::Write("Host startup");
     SetConsoleCtrlHandler(HandleConsole, TRUE);
 
+    g_nodePipeName = PipeName(kNodePipeBase);
+    g_tsfPipeName = PipeName(kTsfPipeBase);
+
     if (!ClaimExclusiveOwnership()) return 1;
 
     std::wcout << L"TypeScriptWindowsImeHost listening on Node and TSF pipes" << std::endl;
-    NativeLog::Write("Host listening node=%ls tsf=%ls", kNodePipe, kTsfPipe);
+    NativeLog::Write("Host listening node=%ls tsf=%ls", g_nodePipeName.c_str(), g_tsfPipeName.c_str());
 
     std::thread nodeListener(ListenForNodeClient);
     std::thread tsfListener(ListenForTsfClients);
@@ -516,9 +590,16 @@ int wmain() {
         if (g_nodeClient != INVALID_HANDLE_VALUE) {
             DisconnectNamedPipe(g_nodeClient);
             CloseHandle(g_nodeClient);
+            NativeLog::WriteStdout("Node pipe disconnected pipe=%p reason=shutdown", g_nodeClient);
             g_nodeClient = INVALID_HANDLE_VALUE;
         }
     }
+    // Every relay thread has returned, so nothing can post a candidate window
+    // request any more. Releasing the window here also ends the UI thread's
+    // work for this process.
+    CandidateWindow::Destroy();
+
     NativeLog::Write("Host shutdown complete");
+    NativeLog::WriteStdout("Host shutdown complete");
     return 0;
 }

@@ -94,3 +94,55 @@ func TestJsonEscapeQuotesForTheHost(t *testing.T) {
 		}
 	}
 }
+
+// These cover what the Host is asked to draw, and what focus returning to the
+// application is allowed to put back on screen.
+
+func TestCandidatesPayloadEncodesSelectionAndCaret(t *testing.T) {
+	reply := `{"id":7,"consume":true,"composition":"ni",` +
+		`"candidates":[{"text":"你","index":0},{"text":"拟","index":1}],"selectedCandidate":1}`
+	payload := candidatesPayload(reply, [4]int32{10, 20, 30, 40})
+	for _, want := range []string{
+		`"candidates":["你","拟"]`,
+		`"selection":1`,
+		`"caret":{"left":10,"top":20,"right":30,"bottom":40}`,
+	} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("candidatesPayload() = %s, want it to contain %s", payload, want)
+		}
+	}
+}
+
+func TestCandidatesPayloadIsEmptyWhenTheListMustHide(t *testing.T) {
+	for _, reply := range []string{
+		// A chosen candidate commits, so the list has to go.
+		`{"id":7,"consume":true,"composition":"","commit":"你","candidates":[{"text":"你"}]}`,
+		// No candidates at all.
+		`{"id":7,"consume":true,"composition":"ni"}`,
+		// Candidates but no composition to compose.
+		`{"id":7,"consume":true,"composition":"","candidates":[{"text":"你"}]}`,
+	} {
+		if payload := candidatesPayload(reply, [4]int32{10, 20, 30, 40}); payload != "" {
+			t.Errorf("candidatesPayload(%s) = %q, want an empty hide request", reply, payload)
+		}
+	}
+}
+
+func TestRestoreCandidatesIgnoresAServiceWithNoComposition(t *testing.T) {
+	service := &tipImpl{}
+	service.shownCandidates.Store(`,"candidates":["你","拟"],"selection":0`)
+	// No composition and nothing remembered: a remembered list alone must not
+	// reach the Host, because no keystroke could consume a pick from it.
+	service.restoreCandidates()
+	if service.shownCandidates.Load().(string) != `,"candidates":["你","拟"],"selection":0` {
+		t.Error("restoreCandidates must not touch the remembered payload")
+	}
+}
+
+func TestRestoreCandidatesIgnoresNothingRemembered(t *testing.T) {
+	service := &tipImpl{}
+	service.composition.Store(1)
+	service.compositionContext.Store(1)
+	service.shownCandidates.Store("")
+	service.restoreCandidates()
+}

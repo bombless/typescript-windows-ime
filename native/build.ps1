@@ -77,6 +77,11 @@ try {
     cl.exe /nologo /std:c++17 /EHsc /W4 /c CandidateWindow.cpp /Fo:"$out\CandidateWindow.obj"
     cl.exe /nologo /std:c++17 /EHsc /W4 PipeBridgeSmoke.cpp "$out\PipeBridge.obj" /Fe:"$out\PipeBridgeSmoke.exe"
     cl.exe /nologo /std:c++17 /EHsc /W4 PipeBridgeTest.cpp "$out\PipeBridge.obj" /Fe:"$out\PipeBridgeTest.exe"
+    # Reproduces the 6.1 deadlock: two sessions show the candidate list, both
+    # disconnect, and a third session must still connect and be answered. It
+    # starts its own Host on private pipes, so a real Host keeps running.
+    cl.exe /nologo /std:c++17 /EHsc /W4 HostDeadlockTest.cpp /Fe:"$out\HostDeadlockTest.exe" /link user32.lib advapi32.lib
+    if ($LASTEXITCODE -ne 0) { throw "HostDeadlockTest.exe failed to build." }
     cl.exe /nologo /std:c++17 /EHsc /W4 TsfDiagnose.cpp /Fe:"$out\TsfDiagnose.exe" ole32.lib advapi32.lib
     # Standalone harness for the candidate window: drives CandidateWindow directly
     # and verifies the painted result against a desktop capture, so the window

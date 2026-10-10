@@ -581,6 +581,10 @@ const bool pipeConnected = pipe_.ConnectToServer(kPipeName, 250);
             threadMgr_ = nullptr;
         }
         clientId_ = TF_CLIENTID_NULL;
+        // The list lives on the Host's own window, not on this document: the
+        // service is going away and has to take it down before the pipe it is
+        // sent on is disconnected.
+        HideCandidates();
         pipe_.Disconnect();
         compositionContext_ = nullptr;
         if (composition_) {
@@ -602,6 +606,11 @@ bool TestKey(ITfContext*, WPARAM wParam, LPARAM, bool& consume);
     void OnCompositionTerminated();
     bool ProbeCaretRect(RECT& caret);
     void RetryCaret();
+    // The list is drawn on the Host's own window, so it does not follow the
+    // caret: the key sink calls these when TSF moves the focus to or from this
+    // thread, and Deactivate calls Hide before the pipe goes away.
+    void HideCandidates();
+    void ShowCandidatesForComposition();
 
 private:
     static std::string KeyName(WPARAM vk);
@@ -611,7 +620,6 @@ bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
                   std::string& response);
     bool ApplyResponse(ITfContext* context, const std::string& response);
     bool UpdateCandidates(ITfContext* context, const std::string& response, RECT caret);
-    void HideCandidates();
 
     LONG refCount_;
     ITfThreadMgr* threadMgr_;
@@ -687,6 +695,12 @@ HRESULT KeyEventSink::OnSetFocus(BOOL foreground) {
     LogForegroundContext("OnSetFocus", nullptr);
     NativeLog::Write("OnSetFocus service=%p foreground=%d", service_, foreground ? 1 : 0);
     service_->LogActiveProfile(foreground ? "OnSetFocus-foreground" : "OnSetFocus-background");
+    // The Host draws the list on a topmost window of its own, so it does not
+    // follow the caret: TSF reports the focus move here and the list has to go
+    // while another application owns the text. Coming back re-shows it while
+    // the composition this service is still holding is alive.
+    if (foreground) service_->ShowCandidatesForComposition();
+    else service_->HideCandidates();
     return S_OK;
 }
 
@@ -925,6 +939,17 @@ void TextService::HideCandidates() {
     pipe_.Notify(request);
 }
 
+void TextService::ShowCandidatesForComposition() {
+    if (!composition_ || !compositionContext_) return;
+    // Re-shows the list the composition is still composing. The anchor is the
+    // caret the last keystroke measured; an empty one is re-probed by the caret
+    // retry timer. UpdateCandidates takes callCoreMutex_ itself and hides again
+    // when the reply it remembers carries no candidates.
+    NativeLog::Write("ShowCandidatesForComposition compositionBytes=%zu replyBytes=%zu",
+        compositionText_.size(), lastCandidateResponse_.size());
+    UpdateCandidates(compositionContext_, lastCandidateResponse_, lastCaretRect_);
+}
+
 void TextService::OnCompositionTerminated() {
     if (composition_) {
         composition_->Release();
@@ -1056,14 +1081,14 @@ HRESULT RegisterTipProfile() {
     hr = profiles->Register(CLSID_TypeScriptWindowsIme);
     NativeLog::Hr("ITfInputProcessorProfiles::Register", hr);
     if (SUCCEEDED(hr)) {
-        const LANGID languages[] = { 0x0409, 0x0804, 0x0411 };
-        for (const LANGID langid : languages) {
-            hr = profiles->AddLanguageProfile(CLSID_TypeScriptWindowsIme, langid,
-                GUID_TypeScriptWindowsImeProfile, kTypeScriptWindowsImeName,
-                static_cast<ULONG>(wcslen(kTypeScriptWindowsImeName)), nullptr, 0, 0);
-            NativeLog::Write("AddLanguageProfile langid=0x%04X hr=0x%08lX", langid, static_cast<unsigned long>(hr));
-            if (FAILED(hr)) break;
-        }
+        // Remove legacy profiles from earlier builds; this TIP is zh-CN only.
+        profiles->RemoveLanguageProfile(CLSID_TypeScriptWindowsIme, 0x0409, GUID_TypeScriptWindowsImeProfile);
+        profiles->RemoveLanguageProfile(CLSID_TypeScriptWindowsIme, 0x0411, GUID_TypeScriptWindowsImeProfile);
+        constexpr LANGID langid = 0x0804; // Simplified Chinese (zh-CN)
+        hr = profiles->AddLanguageProfile(CLSID_TypeScriptWindowsIme, langid,
+            GUID_TypeScriptWindowsImeProfile, kTypeScriptWindowsImeName,
+            static_cast<ULONG>(wcslen(kTypeScriptWindowsImeName)), nullptr, 0, 0);
+        NativeLog::Write("AddLanguageProfile langid=0x%04X hr=0x%08lX", langid, static_cast<unsigned long>(hr));
     }
     if (SUCCEEDED(hr)) {
         ITfCategoryMgr* categoryMgr = nullptr;

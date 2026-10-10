@@ -12,6 +12,7 @@
 #endif
 
 #include <algorithm>
+#include <mutex>
 #include <vector>
 
 namespace CandidateWindow {
@@ -31,6 +32,15 @@ int g_rowHeight = 0;
 int g_numberWidth = 0;
 int g_width = 0;
 int g_height = 0;
+
+// UI thread state. Written by the UI thread, read only after g_uiReady is
+// signaled; g_uiMutex guards the lazy start so concurrent first calls agree.
+HANDLE g_uiThread = nullptr;
+DWORD g_uiThreadId = 0;
+HWND g_uiSink = nullptr;
+HANDLE g_uiReady = nullptr;
+bool g_uiUnavailable = false;
+std::mutex g_uiMutex;
 
 int Scale(int value) { return MulDiv(value, static_cast<int>(g_dpi), 96); }
 size_t Visible(size_t count) { return count < kMaxVisible ? count : kMaxVisible; }
@@ -363,12 +373,44 @@ bool Measure(int& width, int& height) {
     return width > 0 && height > 0;
 }
 
-} // namespace
+// The window used to be created on whichever thread called Show first, so every
+// later caller had to drive a window owned by another thread. SetWindowPos on a
+// cross-thread window is a sent message, and the owning thread here was a TSF
+// relay thread blocked in ReadFile with no message pump, so the caller blocked
+// forever while holding g_renderMutex. The exit path of a session then took
+// g_clientsMutex before g_renderMutex and wedged the Host: accept had already
+// created the pipe instance but never reached ConnectNamedPipe, which is why
+// clients saw error 231 instead of a connection.
+//
+// One dedicated thread now owns the window and runs the pump. Show, Hide and
+// Destroy post a request to it and wait, so every GDI call and every window
+// message happens on that one thread and a relay thread can never block on a
+// window it does not own.
+constexpr UINT kRequestShow = WM_APP + 1;
+constexpr UINT kRequestHide = WM_APP + 2;
+constexpr UINT kRequestDestroy = WM_APP + 3;
+constexpr wchar_t kSinkClass[] = L"TypeScriptWindowsImeCandidateWindowSink";
 
-bool Show(const std::vector<std::wstring>& candidates, UINT selection, RECT caret, UINT dpi) {
+// The caller owns the request and always frees it: the UI thread fills in
+// `result` and signals `completed` as its last act, so the caller can read the
+// result after the wait without ever racing the thread.
+struct UiRequest {
+    UINT message = 0;
+    std::vector<std::wstring> candidates;
+    UINT selection = 0;
+    RECT caret{};
+    UINT dpi = 96;
+    bool result = false;
+    HANDLE completed = nullptr;
+};
+
+// The drawing half: runs on the UI thread only, never on a caller's thread.
+void HideOnUiThread();
+
+bool ShowOnUiThread(const std::vector<std::wstring>& candidates, UINT selection, RECT caret, UINT dpi) {
     const size_t visible = Visible(candidates.size());
     if (visible == 0) {
-        Hide();
+        HideOnUiThread();
         return false;
     }
     HWND window = EnsureWindow();
@@ -400,7 +442,7 @@ bool Show(const std::vector<std::wstring>& candidates, UINT selection, RECT care
     return true;
 }
 
-void Hide() {
+void HideOnUiThread() {
     if (g_window && IsWindow(g_window)) {
         NativeLog::Write("CandidateWindow Hide");
         ShowWindow(g_window, SW_HIDE);
@@ -409,8 +451,8 @@ void Hide() {
     g_selection = 0;
 }
 
-void Destroy() {
-    Hide();
+void DestroyOnUiThread() {
+    HideOnUiThread();
     if (g_window && IsWindow(g_window)) DestroyWindow(g_window);
     g_window = nullptr;
     if (g_font) {
@@ -421,6 +463,169 @@ void Destroy() {
     g_numberWidth = 0;
     g_width = 0;
     g_height = 0;
+}
+
+void RunRequest(UiRequest* request) {
+    switch (request->message) {
+    case kRequestShow:
+        request->result = ShowOnUiThread(request->candidates, request->selection, request->caret, request->dpi);
+        break;
+    case kRequestHide:
+        HideOnUiThread();
+        request->result = true;
+        break;
+    case kRequestDestroy:
+        DestroyOnUiThread();
+        request->result = true;
+        break;
+    default:
+        break;
+    }
+    SetEvent(request->completed);
+}
+
+LRESULT CALLBACK SinkProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == kRequestShow || message == kRequestHide || message == kRequestDestroy) {
+        UiRequest* request = reinterpret_cast<UiRequest*>(lParam);
+        if (request) RunRequest(request);
+        return 0;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+// The thread outlives every window: DestroyWindow only removes the candidate
+// window, the pump keeps running so a later Show can create it again. Messages
+// aimed at the candidate window arrive on this same queue and are dispatched to
+// WindowProc like any other thread message.
+DWORD WINAPI UiThreadMain(LPVOID) {
+    MSG seed{};
+    PeekMessageW(&seed, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+
+    WNDCLASSEXW sinkClass{};
+    sinkClass.cbSize = sizeof(sinkClass);
+    sinkClass.lpfnWndProc = SinkProc;
+    sinkClass.hInstance = ModuleHandle();
+    sinkClass.lpszClassName = kSinkClass;
+    if (RegisterClassExW(&sinkClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        NativeLog::Win32("CandidateWindow RegisterClassEx sink");
+        SetEvent(g_uiReady);
+        return 0;
+    }
+    g_uiSink = CreateWindowExW(0, kSinkClass, nullptr, 0, 0, 0, 0, 0,
+        HWND_MESSAGE, nullptr, ModuleHandle(), nullptr);
+    SetEvent(g_uiReady);
+    if (!g_uiSink) {
+        NativeLog::Win32("CandidateWindow CreateWindowEx sink");
+        return 0;
+    }
+
+    for (;;) {
+        MSG message{};
+        const BOOL got = GetMessageW(&message, nullptr, 0, 0);
+        if (got <= 0) break;
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    return 0;
+}
+
+bool EnsureUiThread() {
+    std::lock_guard<std::mutex> lock(g_uiMutex);
+    if (g_uiSink) return true;
+    if (g_uiUnavailable) return false;
+    if (!g_uiReady) {
+        g_uiReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!g_uiReady) {
+            g_uiUnavailable = true;
+            return false;
+        }
+    }
+    if (!g_uiThread) {
+        g_uiThread = CreateThread(nullptr, 0, UiThreadMain, nullptr, 0, &g_uiThreadId);
+        if (!g_uiThread) {
+            NativeLog::Win32("CandidateWindow CreateThread ui");
+            g_uiUnavailable = true;
+            CloseHandle(g_uiReady);
+            g_uiReady = nullptr;
+            return false;
+        }
+    }
+    // The sink window exists before the event is set, so this wait is short. The
+    // timeout only guards against a UI thread that can never start; in that case
+    // the request is drawn inline instead, which is the previous behaviour.
+    if (WaitForSingleObject(g_uiReady, 5000) != WAIT_OBJECT_0) {
+        NativeLog::Write("CandidateWindow UI thread did not become ready win32=%lu", GetLastError());
+        return false;
+    }
+    if (!g_uiSink) {
+        NativeLog::Write("CandidateWindow UI thread created no sink window");
+        return false;
+    }
+    return true;
+}
+
+// Posts one request and waits for it. The wait is unbounded on purpose: the UI
+// thread is this process's own thread and its only work is the request itself,
+// so it always answers. A timeout would have to free the request while the UI
+// thread was still writing into it.
+bool PostRequest(UINT message, UiRequest* request) {
+    if (!EnsureUiThread()) return false;
+    return PostMessageW(g_uiSink, message, 0, reinterpret_cast<LPARAM>(request)) != FALSE;
+}
+
+} // namespace
+
+bool Show(const std::vector<std::wstring>& candidates, UINT selection, RECT caret, UINT dpi) {
+    UiRequest request;
+    request.message = kRequestShow;
+    request.candidates = candidates;
+    request.selection = selection;
+    request.caret = caret;
+    request.dpi = dpi;
+    request.completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!request.completed) {
+        NativeLog::Win32("CandidateWindow CreateEvent request");
+        return false;
+    }
+    const bool posted = PostRequest(kRequestShow, &request);
+    if (posted) WaitForSingleObject(request.completed, INFINITE);
+    const bool result = request.result;
+    CloseHandle(request.completed);
+    if (!posted) {
+        // No UI thread: draw here so the list still appears, even though a
+        // caller holding g_renderMutex could then block as it did before.
+        return ShowOnUiThread(candidates, selection, caret, dpi);
+    }
+    return result;
+}
+
+void Hide() {
+    UiRequest request;
+    request.message = kRequestHide;
+    request.completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!request.completed) {
+        NativeLog::Win32("CandidateWindow CreateEvent request");
+        return;
+    }
+    const bool posted = PostRequest(kRequestHide, &request);
+    if (posted) WaitForSingleObject(request.completed, INFINITE);
+    CloseHandle(request.completed);
+    if (!posted) HideOnUiThread();
+}
+
+void Destroy() {
+    UiRequest request;
+    request.message = kRequestDestroy;
+    request.completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!request.completed) {
+        NativeLog::Win32("CandidateWindow CreateEvent request");
+        return;
+    }
+    const bool posted = PostRequest(kRequestDestroy, &request);
+    if (posted) WaitForSingleObject(request.completed, INFINITE);
+    CloseHandle(request.completed);
+    if (!posted) DestroyOnUiThread();
+    // The pump thread outlives this window and is reused by the next Show.
 }
 
 bool Show(const std::vector<std::wstring>& candidates, UINT selection, RECT caret) {
