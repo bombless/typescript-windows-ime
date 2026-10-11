@@ -197,6 +197,7 @@ type editSessionImpl struct {
 	com.IUnknownImpl
 	service *tipImpl
 	context uintptr // *ITfContext, borrowed for the duration of the session.
+	caretRange uintptr // non-zero for a caret-only edit session
 	text    string
 	commit  bool
 	caret   [4]int32
@@ -318,6 +319,28 @@ func (t *tipImpl) runEditSession(context uintptr, text string, commit bool) [4]i
 	strategyLog("StrategyTip edit session ok commit=%v text=%q caret=%d,%d,%d,%d",
 		commit, text, caret[0], caret[1], caret[2], caret[3])
 	return caret
+}
+
+// runCaretEditSession applies a parked selection using a fresh TSF write cookie.
+// ITfContext::SetSelection cannot be called with cookie 0 outside an edit session.
+func (t *tipImpl) runCaretEditSession(context, caretRange uintptr) {
+	if context == 0 || caretRange == 0 {
+		return
+	}
+	session := com.NewComObj[editSessionComObj](&editSessionImpl{
+		service: t, context: context, caretRange: caretRange,
+	})
+	var sessionResult int32
+	hr := C.tipContextRequestEditSession(C.uintptr_t(context), C.uint32_t(t.clientID),
+		C.uintptr_t(uintptr(unsafe.Pointer(session))), C.uint32_t(tfEsSyncReadWrite),
+		(*C.int32_t)(unsafe.Pointer(&sessionResult)))
+	impl := session.Impl().(*editSessionImpl)
+	failed := impl.failed
+	session.Release()
+	if hr < 0 || sessionResult < 0 || failed {
+		strategyLog("StrategyTip caret edit session rejected hr=0x%08x session=0x%08x failed=%v",
+			uint32(hr), uint32(sessionResult), failed)
+	}
 }
 
 // editSessionDoEditSession is the ITfEditSession callback. TSF calls it with a
@@ -443,10 +466,7 @@ func (t *tipImpl) placePendingCaret(context uintptr) {
 		return
 	}
 	defer comRelease(parked)
-	if hr := C.tipContextSetSelection(C.uintptr_t(context), C.uint32_t(0),
-		C.uintptr_t(parked)); hr < 0 {
-		strategyLog("StrategyTip placing the caret: SetSelection hr=0x%08x", uint32(hr))
-	}
+	t.runCaretEditSession(context, parked)
 }
 
 // checkCompositionText reads the range back and reports when it does not hold
@@ -494,6 +514,14 @@ func (s *editSessionImpl) apply(ec uintptr) bool {
 	context := s.context
 	if context == 0 {
 		return false
+	}
+	if s.caretRange != 0 {
+		hr := C.tipContextSetSelection(C.uintptr_t(context), C.uint32_t(ec), C.uintptr_t(s.caretRange))
+		if hr < 0 {
+			strategyLog("StrategyTip placing the caret: SetSelection hr=0x%08x", uint32(hr))
+			return false
+		}
+		return true
 	}
 	var contextComposition uintptr
 	hr := C.tipQueryInterface(C.uintptr_t(context),
