@@ -9,12 +9,22 @@ package main
 #include <windows.h>
 #include <msctf.h>
 #include <objbase.h>
+#include <string.h>
 #undef DllGetClassObject
 #undef DllCanUnloadNow
 
 static const CLSID kClsid = {0xb18f4c27, 0x9a63, 0x4e15, {0x8d, 0x70, 0x2f, 0x6c, 0x1a, 0x5b, 0x9e, 0x34}};
 static const GUID kProfile = {0x4d92e7a1, 0x6b08, 0x4c53, {0xa1, 0xf6, 0x8e, 0x3d, 0x0c, 0x7b, 0x5a, 0x29}};
 static const wchar_t kName[] = L"strategy-generated-bindings";
+
+static const GUID kIidTextInputProcessorEx = {0x6e4e2102, 0xf9cd, 0x433d, {0xb4, 0x96, 0x30, 0x3c, 0xe0, 0x3a, 0x65, 0x07}};
+static const GUID kCatTipKeyboard = {0x34745c63, 0xb2f0, 0x4784, {0x8b, 0x67, 0x5e, 0x12, 0xc8, 0x70, 0x1a, 0x31}};
+static const GUID kCatTipComless = {0x364215d9, 0x75bc, 0x11d7, {0xa6, 0xef, 0x00, 0x06, 0x5b, 0x84, 0x43, 0x5c}};
+static const GUID kCatTipImmersive = {0x13a016df, 0x560b, 0x46cd, {0x94, 0x7a, 0x4c, 0x3a, 0xf1, 0xe0, 0xe3, 0x5d}};
+static const GUID kCatTipSecure = {0x49d2f9ce, 0x1f5e, 0x11d7, {0xa6, 0xd3, 0x00, 0x06, 0x5b, 0x84, 0x43, 0x5c}};
+static const GUID kCatTipSystray = {0x25504fb4, 0x7bab, 0x4bc1, {0x9c, 0x69, 0xcf, 0x81, 0x89, 0x0f, 0x0e, 0xf5}};
+static const GUID kCatTipUIElement = {0x49d2f9cf, 0x1f5e, 0x11d7, {0xa6, 0xd3, 0x00, 0x06, 0x5b, 0x84, 0x43, 0x5c}};
+static void getTextInputProcessorExIID(void* out) { memcpy(out, &kIidTextInputProcessorEx, sizeof(GUID)); }
 
 static HRESULT adviseKeySink(void* threadMgr, DWORD clientId, void* sink) {
     ITfKeystrokeMgr* keys = NULL;
@@ -90,7 +100,18 @@ static HRESULT registerTip(void) {
         hr = CoCreateInstance(&CLSID_TF_CategoryMgr, NULL, CLSCTX_INPROC_SERVER,
             &IID_ITfCategoryMgr, (void**)&categories);
         if (SUCCEEDED(hr)) {
-            hr = categories->lpVtbl->RegisterCategory(categories, &kClsid, &GUID_TFCAT_TIP_KEYBOARD, &kClsid);
+            const GUID* tipCategories[] = {
+                &kCatTipKeyboard,
+                &kCatTipComless,
+                &kCatTipImmersive,
+                &kCatTipSecure,
+                &kCatTipSystray,
+                &kCatTipUIElement,
+            };
+            for (size_t i = 0; i < sizeof(tipCategories) / sizeof(tipCategories[0]); ++i) {
+                HRESULT categoryHr = categories->lpVtbl->RegisterCategory(categories, &kClsid, tipCategories[i], &kClsid);
+                if (SUCCEEDED(hr) && FAILED(categoryHr)) hr = categoryHr;
+            }
             categories->lpVtbl->Release(categories);
         }
     }
@@ -99,6 +120,22 @@ static HRESULT registerTip(void) {
 }
 
 static HRESULT unregisterTip(void) {
+    ITfCategoryMgr* categories = NULL;
+    HRESULT categoryHr = CoCreateInstance(&CLSID_TF_CategoryMgr, NULL, CLSCTX_INPROC_SERVER,
+        &IID_ITfCategoryMgr, (void**)&categories);
+    if (SUCCEEDED(categoryHr)) {
+        const GUID* tipCategories[] = {
+            &kCatTipKeyboard,
+            &kCatTipComless,
+            &kCatTipImmersive,
+            &kCatTipSecure,
+            &kCatTipSystray,
+            &kCatTipUIElement,
+        };
+        for (size_t i = 0; i < sizeof(tipCategories) / sizeof(tipCategories[0]); ++i)
+            categories->lpVtbl->UnregisterCategory(categories, &kClsid, tipCategories[i], &kClsid);
+        categories->lpVtbl->Release(categories);
+    }
     ITfInputProcessorProfiles* profiles = NULL;
     HRESULT hr = CoCreateInstance(&CLSID_TF_InputProcessorProfiles, NULL, CLSCTX_INPROC_SERVER,
         &IID_ITfInputProcessorProfiles, (void**)&profiles);
@@ -328,6 +365,7 @@ func strategyPauseAt(point string) {
 }
 
 func init() {
+	C.getTextInputProcessorExIID(unsafe.Pointer(&iidTextInputProcessorEx))
 	// Default Go traceback behaviour prints to stderr, which a GUI application
 	// never shows, and only the crashing goroutine. Both sinks are useless here.
 	if os.Getenv("GOTRACEBACK") == "" {
@@ -848,6 +886,7 @@ func connectAndProbe(generation uint64) {
 var clsidStrategy = syscall.GUID{Data1: 0xB18F4C27, Data2: 0x9A63, Data3: 0x4E15, Data4: [8]byte{0x8D, 0x70, 0x2F, 0x6C, 0x1A, 0x5B, 0x9E, 0x34}}
 
 var iidTextInputProcessor = syscall.GUID{Data1: 0xAA80E7F7, Data2: 0x2021, Data3: 0x11D2, Data4: [8]byte{0x93, 0xE0, 0x00, 0x60, 0xB0, 0x67, 0xB8, 0x6E}}
+var iidTextInputProcessorEx syscall.GUID
 
 var iidKeyEventSink = closedtsf.IID_ITfKeyEventSink
 
@@ -859,6 +898,8 @@ func guidText(guid syscall.GUID) string {
 		return "CLSID_StrategyTip"
 	case iidTextInputProcessor:
 		return "IID_ITfTextInputProcessor"
+	case iidTextInputProcessorEx:
+		return "IID_ITfTextInputProcessorEx"
 	case iidKeyEventSink:
 		return "IID_ITfKeyEventSink"
 	}
@@ -1009,15 +1050,42 @@ type tipVtbl struct {
 	win32.IUnknownVtbl
 	Activate   uintptr
 	Deactivate uintptr
+	ActivateEx uintptr
+}
+
+type legacyTipVtbl struct {
+	win32.IUnknownVtbl
+	Activate   uintptr
+	Deactivate uintptr
 }
 
 type tipComObj struct {
 	com.IUnknownComObj
-	keySinkComObj keySinkComObj
+	keySinkComObj   keySinkComObj
+	legacyTipComObj legacyTipComObj
 }
 
 func (t *tipComObj) GetSubComObjs() []com.ComObjInterface {
-	return []com.ComObjInterface{&t.keySinkComObj}
+	return []com.ComObjInterface{&t.keySinkComObj, &t.legacyTipComObj}
+}
+
+type legacyTipComObj struct{ com.IUnknownComObj }
+
+func (t *legacyTipComObj) IID() *syscall.GUID { return &iidTextInputProcessor }
+func (t *legacyTipComObj) GetVtbl() *win32.IUnknownVtbl {
+	return (*win32.IUnknownVtbl)(unsafe.Pointer(t.BuildLegacyTipVtbl()))
+}
+func (t *legacyTipComObj) BuildLegacyTipVtbl() *legacyTipVtbl {
+	com.MuVtbl.Lock()
+	defer com.MuVtbl.Unlock()
+	if legacyTipVTable == nil {
+		v := (*legacyTipVtbl)(com.Malloc(unsafe.Sizeof(legacyTipVtbl{})))
+		v.IUnknownVtbl = *t.IUnknownComObj.BuildVtbl(false)
+		v.Activate = syscall.NewCallback(legacyTipActivateCallback)
+		v.Deactivate = syscall.NewCallback(legacyTipDeactivateCallback)
+		legacyTipVTable = v
+	}
+	return legacyTipVTable
 }
 
 // keyName mirrors the native TSF implementation's key-name mapping.
@@ -1134,8 +1202,9 @@ func (k *keySinkComObj) BuildKeySinkVtbl(lock bool) *closedtsf.ITfKeyEventSinkVt
 }
 
 var tipVTable *tipVtbl
+var legacyTipVTable *legacyTipVtbl
 
-func (t *tipComObj) IID() *syscall.GUID { return &iidTextInputProcessor }
+func (t *tipComObj) IID() *syscall.GUID { return &iidTextInputProcessorEx }
 
 func (t *tipComObj) BuildTipVtbl() *tipVtbl {
 	com.MuVtbl.Lock()
@@ -1145,6 +1214,7 @@ func (t *tipComObj) BuildTipVtbl() *tipVtbl {
 		v.IUnknownVtbl = *t.IUnknownComObj.BuildVtbl(false)
 		v.Activate = syscall.NewCallback(tipActivateCallback)
 		v.Deactivate = syscall.NewCallback(tipDeactivateCallback)
+		v.ActivateEx = syscall.NewCallback(tipActivateExCallback)
 		tipVTable = v
 	}
 	return tipVTable
@@ -1235,6 +1305,30 @@ func tipActivateCallback(this uintptr, threadMgr uintptr, clientID uintptr) uint
 func tipDeactivateCallback(this uintptr) uintptr {
 	return guardedCall("ITfTextInputProcessor.Deactivate", func() uintptr {
 		return uintptr((*tipComObj)(unsafe.Pointer(this)).Impl().(*tipImpl).Deactivate())
+	})
+}
+
+func tipActivateExCallback(this uintptr, threadMgr uintptr, clientID uintptr, flags uintptr) uintptr {
+	return guardedCall("ITfTextInputProcessorEx.ActivateEx", func() uintptr {
+		strategyLog("StrategyTip ActivateEx flags=0x%08x secure=%v uiElementOnly=%v noActivateTip=%v console=%v wow16=%v",
+			uint32(flags), flags&0x2 != 0, flags&0x4 != 0, flags&0x1 != 0, flags&0x40 != 0, flags&0x10 != 0)
+		obj := (*tipComObj)(unsafe.Pointer(this))
+		hr := obj.Impl().(*tipImpl).Activate((*win32.IUnknown)(unsafe.Pointer(threadMgr)), uint32(clientID))
+		strategyLog("StrategyTip ActivateEx result hr=0x%08x", uint32(hr))
+		return uintptr(hr)
+	})
+}
+
+func legacyTipActivateCallback(this uintptr, threadMgr uintptr, clientID uintptr) uintptr {
+	return guardedCall("ITfTextInputProcessor.Activate", func() uintptr {
+		obj := (*legacyTipComObj)(unsafe.Pointer(this))
+		return uintptr(obj.Impl().(*tipImpl).Activate((*win32.IUnknown)(unsafe.Pointer(threadMgr)), uint32(clientID)))
+	})
+}
+
+func legacyTipDeactivateCallback(this uintptr) uintptr {
+	return guardedCall("ITfTextInputProcessor.Deactivate", func() uintptr {
+		return uintptr((*legacyTipComObj)(unsafe.Pointer(this)).Impl().(*tipImpl).Deactivate())
 	})
 }
 
