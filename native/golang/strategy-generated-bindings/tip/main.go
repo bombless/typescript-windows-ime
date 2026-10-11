@@ -15,7 +15,7 @@ package main
 
 static const CLSID kClsid = {0xb18f4c27, 0x9a63, 0x4e15, {0x8d, 0x70, 0x2f, 0x6c, 0x1a, 0x5b, 0x9e, 0x34}};
 static const GUID kProfile = {0x4d92e7a1, 0x6b08, 0x4c53, {0xa1, 0xf6, 0x8e, 0x3d, 0x0c, 0x7b, 0x5a, 0x29}};
-static const wchar_t kName[] = L"strategy-generated-bindings";
+static const wchar_t kName[] = L"中文输入法";
 
 static const GUID kIidTextInputProcessorEx = {0x6e4e2102, 0xf9cd, 0x433d, {0xb4, 0x96, 0x30, 0x3c, 0xe0, 0x3a, 0x65, 0x07}};
 static const GUID kCatTipKeyboard = {0x34745c63, 0xb2f0, 0x4784, {0x8b, 0x67, 0x5e, 0x12, 0xc8, 0x70, 0x1a, 0x31}};
@@ -377,10 +377,13 @@ func init() {
 	go watchForDumpRequests()
 }
 
-func probeLines(session uint64) (string, string) {
-	hello := fmt.Sprintf(`{"id":1,"session":%d,"type":"hello","protocol":3}`, session)
-	show := fmt.Sprintf(`{"id":2,"session":%d,"type":"showCandidates","candidates":["strategy-generated-bindings"],"selection":0,"caret":{"left":200,"top":200,"right":400,"bottom":220},"dpi":96}`, session)
-	return hello, show
+// helloLine is the only message activation sends. A candidate notification used
+// to follow it with a hardcoded list, which made the Host draw a floating window
+// over the application as soon as the input method was selected. Candidate lists
+// only ever come from a key reply now, so switching to this input method shows
+// nothing until the user actually types.
+func helloLine(session uint64) string {
+	return fmt.Sprintf(`{"id":1,"session":%d,"type":"hello","protocol":3}`, session)
 }
 
 func errnoOf(err error) syscall.Errno {
@@ -847,7 +850,7 @@ func describeReply(text string) string {
 
 func connectAndProbe(generation uint64) {
 	session := strategySessionID()
-	pipeRequestID.Store(2) // hello and showCandidates use IDs 1 and 2.
+	pipeRequestID.Store(1) // hello uses ID 1; every later request increments it.
 	strategyLog("StrategyTip connect start generation=%d session=%d pipe=%s", generation, session, tsfPipeName)
 	handle, err := dialTsf(pipeDialTimeout)
 	if err != nil {
@@ -864,19 +867,12 @@ func connectAndProbe(generation uint64) {
 		strategyLog("StrategyTip connect discarded generation=%d", generation)
 		return
 	}
-	hello, show := probeLines(session)
-	if err = writeLine(handle, hello); err != nil {
+	if err = writeLine(handle, helloLine(session)); err != nil {
 		strategyLog("StrategyTip hello failed generation=%d win32=%v", generation, err)
 		releaseIfOwner(handle)
 		return
 	}
 	strategyLog("StrategyTip sent hello session=%d", session)
-	if err = writeLine(handle, show); err != nil {
-		strategyLog("StrategyTip showCandidates failed generation=%d win32=%v", generation, err)
-		releaseIfOwner(handle)
-		return
-	}
-	strategyLog("StrategyTip sent showCandidates session=%d", session)
 	pipeReady.Store(true)
 	strategyLog("StrategyTip pipe ready for keyboard events session=%d", session)
 	drainPipe(generation, handle)
@@ -966,7 +962,6 @@ type tipImpl struct {
 	// in. 0 means there is none.
 	composition           atomic.Uintptr
 	compositionContext    atomic.Uintptr
-	compositionText       atomic.Value
 	compositionTerminated atomic.Bool
 	// The text the composition range was last given to write. The range does
 	// not grow with it, so the next write has to replace it by hand, and a
@@ -1036,7 +1031,6 @@ func (t *tipImpl) Deactivate() win32.HRESULT {
 	}
 	t.dropComposition()
 	t.compositionContext.Store(0)
-	t.compositionText.Store("")
 	// The remembered list belongs to a composition that no longer exists, so a
 	// later activation must not restore it on focus.
 	t.shownCandidates.Store("")

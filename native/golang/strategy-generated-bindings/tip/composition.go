@@ -789,7 +789,6 @@ func (t *tipImpl) applyComposition(context uintptr, reply string) [4]int32 {
 	commit := replyString(reply, "commit")
 	strategyLog("StrategyTip applyComposition begin context=%#x composition=%q commit=%q hasCommit=%v previousWritten=%q range=%#x", context, composition, commit, replyHas(reply, "commit"), previous, uintptr(t.composition.Load()))
 	t.compositionContext.Store(context)
-	t.compositionText.Store(composition)
 	if composition != "" {
 		t.compositionTerminated.Store(false)
 	}
