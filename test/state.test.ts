@@ -85,6 +85,27 @@ describe("initial key behavior", () => {
     expect(reduceKey(state, { id: 7, session: 1, type: "keyUp", vk: 65, scanCode: 30, key: "A", modifiers: 0 }))
       .toEqual({ state, consume: false });
   });
+  it("passes Ctrl/Alt shortcuts and Shift+Space through without changing composition", async () => {
+    const { SimpleEngine } = await import("../src/ime/engine.js");
+    const engine = new SimpleEngine();
+    const state = { composition: "ni", selectedCandidate: 1 };
+    const shortcuts = [
+      { id: 70, vk: 0x56, key: "V", modifiers: 2 }, // Ctrl+V
+      { id: 71, vk: 0x41, key: "A", modifiers: 2 }, // Ctrl+A
+      { id: 72, vk: 0x20, key: " ", modifiers: 1 }, // Shift+Space
+      { id: 73, vk: 0x09, key: "Tab", modifiers: 4 }, // Alt+Tab
+      { id: 74, vk: 0x20, key: " ", modifiers: 8 }, // Win+Space
+    ];
+
+    for (const shortcut of shortcuts) {
+      const event = { ...shortcut, session: 1, scanCode: 0, type: "keyDown" as const };
+      expect(engine.testKey({ ...event, type: "testKeyDown" }, state), shortcut.key).toEqual({ consume: false });
+      const result = engine.processKey(event, state);
+      expect(result.response.consume, shortcut.key).toBe(false);
+      expect(result.state, shortcut.key).toEqual(state);
+    }
+  });
+
   it("commits the top Rime candidate instead of raw pinyin", async () => {
     const { SimpleEngine } = await import("../src/ime/engine.js");
     const engine = new SimpleEngine();

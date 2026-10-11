@@ -899,6 +899,7 @@ int TextService::Modifiers() {
     if (GetKeyState(VK_SHIFT) & 0x8000) modifiers |= 1;
     if (GetKeyState(VK_CONTROL) & 0x8000) modifiers |= 2;
     if (GetKeyState(VK_MENU) & 0x8000) modifiers |= 4;
+    if ((GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000)) modifiers |= 8;
     return modifiers;
 }
 
@@ -942,28 +943,13 @@ bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bo
 
 bool TextService::TestKey(ITfContext* context, WPARAM wParam, LPARAM lParam, bool& consume) {
     (void)context;
-    // Win+Space belongs to Windows' input-method switcher, not this TIP.
-    // Do not forward it to Node as a plain Space key or allow the TSF sink
-    // to consume it before the shell can advance to the next input method.
-    if (wParam == VK_SPACE &&
-        ((GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000))) {
-        consume = false;
-        NativeLog::Write("TestKey bypass Win+Space");
-        return true;
-    }
+    // Forward modifier state to TypeScript; the core owns shortcut policy.
     std::string response;
     return CallCore("testKeyDown", wParam, lParam, consume, response);
 }
 
 bool TextService::HandleKey(ITfContext* context, WPARAM wParam, LPARAM lParam, bool& consume) {
-    // Win+Space belongs to Windows' input-method switcher. Keep it completely
-    // transparent to the IME so Windows can perform the profile transition.
-    if (wParam == VK_SPACE &&
-        ((GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000))) {
-        consume = false;
-        NativeLog::Write("HandleKey bypass Win+Space");
-        return true;
-    }
+    // Shortcut consumption is decided by TypeScript using the forwarded modifiers.
     std::string response;
     if (!CallCore("keyDown", wParam, lParam, consume, response)) return false;
     if (consume && context) return ApplyResponse(context, response);

@@ -7,6 +7,12 @@ export interface Reduction { state: ImeState; consume: boolean; commit?: string;
 export function reduceKey(state: ImeState, event: KeyMessage): Reduction {
   if (event.type !== "keyDown") return { state, consume: false };
   const key = event.key;
+  // Modifier shortcuts belong to Windows/the focused application, not the
+  // IME. Native modifier bits are Shift=1, Ctrl=2, Alt=4. Keep this policy in
+  // TypeScript so testKeyDown and keyDown agree and shortcuts never mutate state.
+  if ((event.modifiers & (2 | 4 | 8)) !== 0 || ((event.modifiers & 1) !== 0 && !/^[A-Za-z]$/.test(key))) {
+    return { state, consume: false };
+  }
   const candidates = getCandidates(state.composition);
   if (/^[A-Za-z]$/.test(key)) return { state: { composition: state.composition + key.toLowerCase(), selectedCandidate: 0 }, consume: true };
   if (key === "Backspace") {
