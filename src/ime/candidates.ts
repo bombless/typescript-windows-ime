@@ -7,7 +7,8 @@ interface Entry { text: string; code: string; weight: number; }
 interface PartialCandidate { text: string; weight: number; }
 const DICTIONARY_PATH = fileURLToPath(new URL("../../data/pinyin_simp.dict.yaml", import.meta.url));
 const MICROSOFT_DICTIONARY_PATH = fileURLToPath(new URL("../../data/microsoft_pinyin.dict.yaml", import.meta.url));
-const MAX_CANDIDATES = 9;
+// Keep enough results available for candidate paging; the UI displays 9 per page.
+const MAX_CANDIDATES = 90;
 const toSimplified = OpenCC.Converter({ from: "twp", to: "cn" });
 
 function normalizeCode(value: string): string {
@@ -30,14 +31,25 @@ function loadDictionary(path = DICTIONARY_PATH): Map<string, Entry[]> {
       const columns = line.split("\t");
       const text = columns[0]?.trim() ?? "";
       if (!text) continue;
-      let code = normalizeCode(columns[1]?.trim() ?? "");
+      const rawCode = columns[1]?.trim() ?? "";
+      const code = normalizeCode(rawCode);
       if (!/^[a-z]+$/.test(code)) continue;
       const rawWeight = columns[2]?.trim() ?? "";
       const weight = rawWeight.endsWith("%") ? 0 : Number.parseFloat(rawWeight);
       const entry: Entry = { text, code, weight: Number.isFinite(weight) ? weight : 0 };
-      const list = entries.get(code) ?? [];
-      list.push(entry);
-      entries.set(code, list);
+      const addEntry = (key: string, value: Entry): void => {
+        const list = entries.get(key) ?? [];
+        list.push(value);
+        entries.set(key, list);
+      };
+      addEntry(code, entry);
+      // Rime-style dictionaries preserve syllable boundaries with spaces. Add
+      // an initials alias (e.g. "da jia" -> "dj") for abbreviated input.
+      const syllables = rawCode.toLowerCase().split(/[\s'’`-]+/).filter(Boolean);
+      if (syllables.length > 1 && syllables.every((syllable) => /^[a-z]+$/.test(syllable))) {
+        const initials = syllables.map((syllable) => syllable[0]).join("");
+        if (initials !== code) addEntry(initials, { ...entry, code: initials });
+      }
     }
   };
 

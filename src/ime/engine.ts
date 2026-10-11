@@ -16,9 +16,11 @@ export class SimpleEngine implements ImeEngine {
 
   processKey(event: KeyMessage, state: ImeState) {
     const result = reduceKey(state, event);
-    const candidates = result.commit !== undefined
+    const allCandidates = result.commit !== undefined
       ? getCandidates(state.composition)
       : getCandidates(result.state.composition);
+    const page = result.state.candidatePage ?? 0;
+    const candidates = allCandidates.slice(page * 9, page * 9 + 9);
     const response: ResponseMessage = {
       id: event.id,
       session: event.session,

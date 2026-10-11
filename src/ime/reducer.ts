@@ -32,34 +32,45 @@ export function reduceKey(state: ImeState, event: KeyMessage): Reduction {
     return { state: { composition: "", selectedCandidate: 0 }, consume: true, commit: punctuation };
   }
   const candidates = getCandidates(state.composition);
-  if (/^[A-Za-z]$/.test(key)) return { state: { composition: state.composition + key.toLowerCase(), selectedCandidate: 0 }, consume: true };
+  if (/^[A-Za-z]$/.test(key)) return { state: { ...state, composition: state.composition + key.toLowerCase(), selectedCandidate: 0, ...(state.candidatePage !== undefined ? { candidatePage: 0 } : {}) }, consume: true };
   if (key === "Backspace") {
     if (!state.composition) return { state, consume: false };
-    return { state: { composition: state.composition.slice(0, -1), selectedCandidate: 0 }, consume: true };
+    return { state: { ...state, composition: state.composition.slice(0, -1), selectedCandidate: 0, ...(state.candidatePage !== undefined ? { candidatePage: 0 } : {}) }, consume: true };
   }
   if (key === "Delete") {
     if (!state.composition) return { state, consume: false };
-    return { state: { composition: state.composition.slice(1), selectedCandidate: 0 }, consume: true };
+    return { state: { ...state, composition: state.composition.slice(1), selectedCandidate: 0, ...(state.candidatePage !== undefined ? { candidatePage: 0 } : {}) }, consume: true };
   }
   if (key === "Escape") {
     if (!state.composition) return { state, consume: false };
     return { state: { composition: "", selectedCandidate: 0 }, consume: true };
   }
+  // <-> / PageUp moves to the previous page; <=> / PageDown moves forward.
+  if (["<->", "<=>", "PageUp", "PageDown"].includes(key)) {
+    if (!state.composition || candidates.length <= 9) return { state, consume: false };
+    const pageCount = Math.ceil(candidates.length / 9);
+    const currentPage = state.candidatePage ?? 0;
+    const delta = key === "<->" || key === "PageUp" ? -1 : 1;
+    const candidatePage = Math.max(0, Math.min(pageCount - 1, currentPage + delta));
+    if (candidatePage === currentPage) return { state, consume: false };
+    return { state: { ...state, candidatePage, selectedCandidate: 0 }, consume: true };
+  }
   if (["ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight"].includes(key)) {
     if (!state.composition || candidates.length === 0) return { state, consume: false };
     const delta = key === "ArrowUp" || key === "ArrowLeft" ? -1 : 1;
-    const selectedCandidate = Math.max(0, Math.min(candidates.length - 1, state.selectedCandidate + delta));
+    const pageCandidates = candidates.slice((state.candidatePage ?? 0) * 9, (state.candidatePage ?? 0) * 9 + 9);
+    const selectedCandidate = Math.max(0, Math.min(pageCandidates.length - 1, state.selectedCandidate + delta));
     return { state: { ...state, selectedCandidate }, consume: true };
   }
   if (/^[1-9]$/.test(key) && state.composition) {
-    const index = Number(key) - 1;
+    const index = (state.candidatePage ?? 0) * 9 + Number(key) - 1;
     if (index >= candidates.length) return { state, consume: false };
     return { state: { composition: "", selectedCandidate: 0 }, consume: true, commit: candidates[index]!.text };
   }
   if (key === " " || key === "Spacebar" || key === "Enter") {
     if (!state.composition) return { state, consume: false };
     return { state: { composition: "", selectedCandidate: 0 }, consume: true,
-      commit: candidates[state.selectedCandidate]?.text ?? candidates[0]?.text ?? state.composition };
+      commit: candidates[(state.candidatePage ?? 0) * 9 + state.selectedCandidate]?.text ?? candidates[(state.candidatePage ?? 0) * 9]?.text ?? state.composition };
   }
   return { state, consume: false };
 }
