@@ -24,7 +24,9 @@ function Assert-Amd64Pe([string]$Path) {
     finally { $stream.Dispose() }
 }
 
-$serviceName = "strategy-generated-bindings"
+# Shown by the language bar and the IME switcher, so it must be the product
+# name and never the module directory name.
+$serviceName = "TypeScript Windows IME (Go)"
 $clsid = "{B18F4C27-9A63-4E15-8D70-2F6C1A5B9E34}"
 $profile = "{4D92E7A1-6B08-4C53-A1F6-8E3D0C7B5A29}"
 $cppClsid = "{7B2E4F5A-3A8E-4D74-9F0B-6D5D6F0E6C41}"
@@ -63,6 +65,25 @@ if (-not $Unregister -and -not $SkipBuild) {
         $env:CGO_LDFLAGS = "-lole32 -luuid -loleaut32"
         Push-Location $PSScriptRoot
         try {
+            # Embed a VERSIONINFO resource so Windows shows "TypeScript Windows
+            # IME (Go)" in the IME switcher instead of falling back to the Go
+            # module path (strategy-generated-bindings) when the DLL has no
+            # file description.
+            $goWinres = Join-Path (go env GOPATH) "bin\go-winres.exe"
+            if (-not (Test-Path -LiteralPath $goWinres)) {
+                $env:GOSUMDB = "off"
+                & go install github.com/tc-hib/go-winres@latest
+                if ($LASTEXITCODE -ne 0) { throw "go-winres install failed with exit code $LASTEXITCODE." }
+            }
+            # go-winres writes rsrc_windows_amd64.syso next to --in; the Go
+            # linker only auto-includes .syso files from the package
+            # directory, so run it from tip/.
+            Push-Location (Join-Path $PSScriptRoot "tip")
+            try {
+                & $goWinres make --in winres.json --arch amd64
+            }
+            finally { Pop-Location }
+            if ($LASTEXITCODE -ne 0) { throw "go-winres make failed with exit code $LASTEXITCODE." }
             & go build -buildmode=c-shared -o $builtDll ./tip
             if ($LASTEXITCODE -ne 0) { throw "TIP DLL build failed with exit code $LASTEXITCODE." }
         }
@@ -115,6 +136,28 @@ if (-not (Test-Path -LiteralPath $registerHost)) { throw "Registration host was 
 # The elevated host can be 32-bit. Force the 64-bit registry view used by TSF.
 $reg64 = @("/reg:64")
 $log = Join-Path $PSScriptRoot "install.log"
+# Elevation runs this script under Windows PowerShell 5.1 when pwsh is not the
+# launcher, and 5.1 turns reg.exe's expected "key not found" stderr into a
+# terminating error even with 2>$null ($PSNativeCommandUseErrorActionPreference
+# only exists in PowerShell 7.3+). Temporarily drop to Continue so reg.exe
+# diagnostics become plain ErrorRecords that 2>$null discards.
+function Invoke-Reg {
+    param(
+        [Parameter(Mandatory)] [string[]]$Arguments,
+        [switch]$Capture
+    )
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if ($Capture) {
+            $output = & $reg @Arguments 2>$null
+            return [pscustomobject]@{ Output = @($output); ExitCode = $LASTEXITCODE }
+        }
+        $null = & $reg @Arguments 2>$null
+        return $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $prevEap }
+}
 $transcript = $false
 try {
     Start-Transcript -LiteralPath $log -Force -ErrorAction Stop | Out-Null
@@ -125,8 +168,9 @@ try {
 
 if ($Unregister) {
     $inprocKey = "HKLM\SOFTWARE\Classes\CLSID\$clsid\InprocServer32"
-    $query = & $reg query $inprocKey /ve @reg64 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    $queryResult = Invoke-Reg -Capture -Arguments (@("query", $inprocKey, "/ve") + $reg64)
+    $query = $queryResult.Output
+    if ($queryResult.ExitCode -eq 0) {
         $line = @($query | Where-Object { $_ -match "REG_SZ" } | Select-Object -Last 1)
         $registered = ""
         if ($line) { $registered = ($line -replace "^.*REG_SZ\s+", "").Trim() }
@@ -136,17 +180,18 @@ if ($Unregister) {
             if ($process.ExitCode -ne 0) { throw "DllUnregisterServer failed with exit code $($process.ExitCode) for $registered." }
         }
     }
-    & $reg delete "HKLM\SOFTWARE\Classes\CLSID\$clsid" /f @reg64 2>$null | Out-Null
-    & $reg delete "HKLM\SOFTWARE\Microsoft\CTF\TIP\$clsid" /f @reg64 2>$null | Out-Null
-    & $reg delete "HKCU\Software\Microsoft\CTF\TIP\$clsid" /f @reg64 2>$null | Out-Null
+    $null = Invoke-Reg -Arguments (@("delete", "HKLM\SOFTWARE\Classes\CLSID\$clsid", "/f") + $reg64)
+    $null = Invoke-Reg -Arguments (@("delete", "HKLM\SOFTWARE\Microsoft\CTF\TIP\$clsid", "/f") + $reg64)
+    $null = Invoke-Reg -Arguments (@("delete", "HKCU\Software\Microsoft\CTF\TIP\$clsid", "/f") + $reg64)
     Write-Host "Unregistered $serviceName ($clsid)."
     exit 0
 }
 
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 $previousKey = "HKLM\SOFTWARE\Classes\CLSID\$clsid\InprocServer32"
-$previousQuery = & $reg query $previousKey /ve @reg64 2>$null
-if ($LASTEXITCODE -eq 0) {
+$previousResult = Invoke-Reg -Capture -Arguments (@("query", $previousKey, "/ve") + $reg64)
+if ($previousResult.ExitCode -eq 0) {
+    $previousQuery = $previousResult.Output
     $previousLine = @($previousQuery | Where-Object { $_ -match "REG_SZ" } | Select-Object -Last 1)
     $previousDll = ""
     if ($previousLine) { $previousDll = ($previousLine -replace "^.*REG_SZ\s+", "").Trim() }
@@ -163,34 +208,33 @@ if ($process.ExitCode -ne 0) { throw "DllRegisterServer failed with exit code $(
 
 $clsidKey = "HKLM\SOFTWARE\Classes\CLSID\$clsid"
 $inprocKey = "$clsidKey\InprocServer32"
-& $reg add $clsidKey /ve /t REG_SZ /d $serviceName /f @reg64 | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Could not write COM class name: $clsidKey" }
-& $reg add $inprocKey /ve /t REG_SZ /d $dll /f @reg64 | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Could not write COM DLL path: $inprocKey" }
-& $reg add $inprocKey /v ThreadingModel /t REG_SZ /d Apartment /f @reg64 | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Could not write COM threading model: $inprocKey" }
-$comQuery = & $reg query $inprocKey /ve @reg64 2>$null
-if ($LASTEXITCODE -ne 0 -or -not (($comQuery -join "`n") -like "*$dll*")) {
+if ((Invoke-Reg -Arguments (@("add", $clsidKey, "/ve", "/t", "REG_SZ", "/d", $serviceName, "/f") + $reg64)) -ne 0) { throw "Could not write COM class name: $clsidKey" }
+if ((Invoke-Reg -Arguments (@("add", $inprocKey, "/ve", "/t", "REG_SZ", "/d", $dll, "/f") + $reg64)) -ne 0) { throw "Could not write COM DLL path: $inprocKey" }
+if ((Invoke-Reg -Arguments (@("add", $inprocKey, "/v", "ThreadingModel", "/t", "REG_SZ", "/d", "Apartment", "/f") + $reg64)) -ne 0) { throw "Could not write COM threading model: $inprocKey" }
+$comResult = Invoke-Reg -Capture -Arguments (@("query", $inprocKey, "/ve") + $reg64)
+if ($comResult.ExitCode -ne 0 -or -not (($comResult.Output -join "`n") -like "*$dll*")) {
     throw "COM registration verification failed. Expected: $dll"
 }
 
 $profileKey = "HKLM\SOFTWARE\Microsoft\CTF\TIP\$clsid\LanguageProfile\0x00000804\$profile"
-& $reg query $profileKey @reg64 2>$null | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "TSF registration verification failed. Language profile was not created: $profileKey" }
-& $reg add $profileKey /v Enable /t REG_DWORD /d 1 /f @reg64 | Out-Null
+$profileResult = Invoke-Reg -Capture -Arguments (@("query", $profileKey) + $reg64)
+if ($profileResult.ExitCode -ne 0) { throw "TSF registration verification failed. Language profile was not created: $profileKey" }
+if ((Invoke-Reg -Arguments (@("add", $profileKey, "/v", "Enable", "/t", "REG_DWORD", "/d", "1", "/f") + $reg64)) -ne 0) { throw "Could not enable the language profile: $profileKey" }
+# AddLanguageProfile stores the name the language bar shows, so it is rewritten
+# from $serviceName here. Without this the old name survives a rename until the
+# DLL is rebuilt, which is exactly how a stale one reached the language bar.
+if ((Invoke-Reg -Arguments (@("add", $profileKey, "/v", "Description", "/t", "REG_SZ", "/d", $serviceName, "/f") + $reg64)) -ne 0) { throw "Could not write the language profile description: $profileKey" }
 
 foreach ($langid in @("00000409", "00000411")) {
     $userProfileKey = "HKCU\Software\Microsoft\CTF\TIP\$clsid\LanguageProfile\0x$langid\$profile"
-    & $reg delete $userProfileKey /f @reg64 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Verbose "No legacy per-user profile to remove: $userProfileKey" }
+    $null = Invoke-Reg -Arguments (@("delete", $userProfileKey, "/f") + $reg64)
 }
 $userZhProfileKey = "HKCU\Software\Microsoft\CTF\TIP\$clsid\LanguageProfile\0x00000804\$profile"
-& $reg add $userZhProfileKey /v Enable /t REG_DWORD /d 1 /f @reg64 | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Per-user zh-CN TSF profile enable failed: $userZhProfileKey" }
+if ((Invoke-Reg -Arguments (@("add", $userZhProfileKey, "/v", "Enable", "/t", "REG_DWORD", "/d", "1", "/f") + $reg64)) -ne 0) { throw "Per-user zh-CN TSF profile enable failed: $userZhProfileKey" }
 
 $cppKey = "HKLM\SOFTWARE\Classes\CLSID\$cppClsid\InprocServer32"
-$cppQuery = & $reg query $cppKey /ve @reg64 2>$null
-if ($LASTEXITCODE -eq 0 -and (($cppQuery -join "`n") -like "*$dll*")) {
+$cppResult = Invoke-Reg -Capture -Arguments (@("query", $cppKey, "/ve") + $reg64)
+if ($cppResult.ExitCode -eq 0 -and (($cppResult.Output -join "`n") -like "*$dll*")) {
     throw "C++ TIP registration was overwritten. Refusing to continue."
 }
 

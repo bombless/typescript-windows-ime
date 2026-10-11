@@ -61,7 +61,14 @@ function Get-RegisteredDllPath([string]$root, [string]$classId, [string]$viewNam
     if (-not $view) { return $null }
     $args = @('query', $path, '/ve')
     if ($view.Switch) { $args += $view.Switch }
-    $output = & $view.Reg @args 2>$null
+    # On PowerShell 7, reg.exe's expected "key not found" stderr can become a
+    # NativeCommandError when ErrorActionPreference is Stop. Treat that as a
+    # normal unsuccessful query; the exit code below is authoritative.
+    try {
+        $output = & $view.Reg @args 2>$null
+    } catch {
+        $output = @()
+    }
     if ($LASTEXITCODE -ne 0) { return $null }
 
     foreach ($line in $output) {
@@ -93,7 +100,11 @@ function Remove-RegistryKey([string]$Path, [string]$ViewName) {
     if (-not $view) { throw "Unknown registry view '$ViewName'." }
     $args = @('delete', $Path, '/f')
     if ($view.Switch) { $args += $view.Switch }
-    $output = & $view.Reg @args 2>$null
+    try {
+        $output = & $view.Reg @args 2>$null
+    } catch {
+        $output = @()
+    }
     $exitCode = $LASTEXITCODE
     if ($exitCode -eq 0) {
         Write-Host "Deleted ($ViewName view): $Path"
@@ -102,7 +113,11 @@ function Remove-RegistryKey([string]$Path, [string]$ViewName) {
     # Missing keys are expected; verify with query before deciding this failed.
     $queryArgs = @('query', $Path)
     if ($view.Switch) { $queryArgs += $view.Switch }
-    & $view.Reg @queryArgs 2>$null | Out-Null
+    try {
+        & $view.Reg @queryArgs 2>$null | Out-Null
+    } catch {
+        # A missing key is expected during idempotent cleanup.
+    }
     if ($LASTEXITCODE -eq 0) {
         throw "Failed to delete registry key ($ViewName view): $Path. $($output -join ' ')"
     }
@@ -205,7 +220,11 @@ foreach ($view in $registryViews) {
     )) {
         $queryArgs = @('query', $path)
         if ($view.Switch) { $queryArgs += $view.Switch }
-        & $view.Reg @queryArgs 2>$null | Out-Null
+        try {
+            & $view.Reg @queryArgs 2>$null | Out-Null
+        } catch {
+            # Missing keys are the expected state during final verification.
+        }
         if ($LASTEXITCODE -eq 0) { $remaining += "$($view.Name): $path" }
     }
 }

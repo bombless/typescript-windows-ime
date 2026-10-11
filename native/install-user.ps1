@@ -69,7 +69,7 @@ $reg = Join-Path $env:WINDIR "System32\reg.exe"
 # explicit write makes this script robust when registry redirection is active.
 $clsidKey = "HKLM\SOFTWARE\Classes\CLSID\$clsid"
 $inprocKey = "$clsidKey\InprocServer32"
-& $reg add $clsidKey /ve /t REG_SZ /d "TypeScript Windows IME" /f | Out-Null
+& $reg add $clsidKey /ve /t REG_SZ /d "TypeScript Windows IME (C++)" /f | Out-Null
 & $reg add $inprocKey /ve /t REG_SZ /d $dll /f | Out-Null
 & $reg add $inprocKey /v ThreadingModel /t REG_SZ /d Apartment /f | Out-Null
 $comQuery = & $reg query $inprocKey /ve 2>$null
@@ -87,8 +87,16 @@ if ($LASTEXITCODE -ne 0) { throw "TSF registration verification failed. Language
 # without this value the IME can appear in the list but fail to switch on.
 foreach ($langid in @("00000409", "00000411")) {
     $userProfileKey = "HKCU\Software\Microsoft\CTF\TIP\$clsid\LanguageProfile\0x$langid\$profile"
-    & $reg delete $userProfileKey /f 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Verbose "No legacy per-user profile to remove: $userProfileKey" }
+    # Missing legacy entries are expected on a fresh install. Check through
+    # the PowerShell registry provider first so reg.exe does not emit a noisy
+    # NativeCommandError for the normal "key not found" case.
+    $providerPath = "Registry::HKEY_CURRENT_USER\Software\Microsoft\CTF\TIP\$clsid\LanguageProfile\0x$langid\$profile"
+    if (Test-Path -LiteralPath $providerPath) {
+        & $reg delete $userProfileKey /f | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Failed to remove legacy per-user profile: $userProfileKey" }
+    } else {
+        Write-Verbose "No legacy per-user profile to remove: $userProfileKey"
+    }
 }
 $userZhProfileKey = "HKCU\Software\Microsoft\CTF\TIP\$clsid\LanguageProfile\0x00000804\$profile"
 & $reg add $userZhProfileKey /v Enable /t REG_DWORD /d 1 /f | Out-Null
@@ -103,4 +111,4 @@ $ctfmon = Join-Path $env:WINDIR "System32\ctfmon.exe"
 if (-not (Test-Path $ctfmon)) { throw "ctfmon.exe was not found at '$ctfmon'." }
 Get-Process ctfmon -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Process -FilePath $ctfmon
-Write-Host "Restart the target application and select 'TypeScript Windows IME'."
+Write-Host "Restart the target application and select 'TypeScript Windows IME (C++)'."
