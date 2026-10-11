@@ -40,6 +40,17 @@ static HRESULT tipContextGetSelectionRange(uintptr_t context, uint32_t ec, uintp
     return S_OK;
 }
 
+// Collapses the document selection onto a range. Without this the caret stays
+// where the composition began, in front of the text the IME just wrote.
+static HRESULT tipContextSetSelection(uintptr_t context, uint32_t ec, uintptr_t range) {
+    TF_SELECTION selection;
+    selection.range = (ITfRange*)(void*)range;
+    selection.style.ase = TF_AE_NONE;
+    selection.style.fInterimChar = FALSE;
+    ITfContext* ctx = (ITfContext*)(void*)context;
+    return ctx->lpVtbl->SetSelection(ctx, ec, 1, &selection);
+}
+
 static HRESULT tipContextGetActiveView(uintptr_t context, uintptr_t* view) {
     ITfContext* ctx = (ITfContext*)(void*)context;
     return ctx->lpVtbl->GetActiveView(ctx, (ITfContextView**)(void**)view);
@@ -385,6 +396,59 @@ func coverCompositionRange(ec uintptr, r uintptr, units int, when string) bool {
 	return true
 }
 
+// placeSelectionAtRangeEnd prepares the selection change that puts the caret
+// behind committed text, without running it. SetText and EndComposition leave
+// the selection where the composition began, so the caret shows up in front of
+// the text the user just committed instead of after it. TSF never moves the
+// selection for us: the only range the composition tracks is its own.
+//
+// The SetSelection itself is deferred because it notifies the application, and
+// a Notepad-class host dispatches that synchronously back into a key callback.
+// That callback would block on the non-reentrant keyMu this edit session runs
+// under and freeze the host, which is exactly the hazard OnCompositionTerminated
+// avoids by only recording a flag. So this clones the range, collapses the clone
+// at the end of the text and parks it on the service. The key sink calls
+// placePendingCaret after keyMu is released.
+func (s *editSessionImpl) placeSelectionAtRangeEnd(ec uintptr, r uintptr) bool {
+	var end uintptr
+	if C.tipRangeClone(C.uintptr_t(r), (*C.uintptr_t)(unsafe.Pointer(&end))) < 0 || end == 0 {
+		strategyLog("StrategyTip placing the caret: cloning the composition range failed")
+		return false
+	}
+	if C.tipRangeCollapse(C.uintptr_t(end), C.uint32_t(ec), C.int32_t(tfAnchorEnd)) < 0 {
+		strategyLog("StrategyTip placing the caret: collapsing the clone failed")
+		comRelease(end)
+		return false
+	}
+	s.service.dropPendingCaret()
+	s.service.pendingCaretRange.Store(end)
+	return true
+}
+
+// dropPendingCaret releases a parked selection change that never ran.
+func (t *tipImpl) dropPendingCaret() {
+	if parked := t.pendingCaretRange.Swap(0); parked != 0 {
+		comRelease(parked)
+	}
+}
+
+// placePendingCaret runs a parked selection change against context, the
+// borrowed ITfContext of the OnKeyDown call that parked it. The key sink calls
+// it after releasing keyMu, so no re-entrant key callback can deadlock against
+// that lock. A failure only loses the caret: the text is already committed, and
+// a fresh edit session is not worth asking for.
+func (t *tipImpl) placePendingCaret(context uintptr) {
+	parked := t.pendingCaretRange.Swap(0)
+	if parked == 0 {
+		return
+	}
+	defer comRelease(parked)
+	if hr := C.tipContextSetSelection(C.uintptr_t(context), C.uint32_t(0),
+		C.uintptr_t(parked)); hr < 0 {
+		strategyLog("StrategyTip placing the caret: SetSelection hr=0x%08x", uint32(hr))
+	}
+}
+
 // checkCompositionText reads the range back and reports when it does not hold
 // exactly want. The buffer is one unit larger than the expected text, so a
 // range that covers too much or too little cannot look like a match.
@@ -520,9 +584,12 @@ func (s *editSessionImpl) apply(ec uintptr) bool {
 	logCompositionRange(comRange, units, "after SetText")
 	s.service.storeWrittenComposition(s.text)
 	s.readCaret(ec, context, comRange)
-	comRelease(comRange)
 
 	if s.commit {
+		// Prepare the caret move now, but do not run SetSelection here: keyMu
+		// is still held and the application could re-enter the TIP. The key
+		// sink finishes the move once the lock is gone.
+		s.placeSelectionAtRangeEnd(ec, comRange)
 		if C.tipCompositionEnd(C.uintptr_t(composition), C.uint32_t(ec)) < 0 {
 			strategyLog("StrategyTip EndComposition failed")
 		}
@@ -530,6 +597,7 @@ func (s *editSessionImpl) apply(ec uintptr) bool {
 		s.service.composition.Store(0)
 		s.service.storeWrittenComposition("")
 	}
+	comRelease(comRange)
 	return true
 }
 

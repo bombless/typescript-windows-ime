@@ -932,6 +932,12 @@ type tipImpl struct {
 	// cancel has to clear it. Empty means a composition writing for the first
 	// time, which must still be allowed to overwrite a selection.
 	compositionWritten atomic.Value // string
+	// When text is committed, a clone of the range collapsed at its end awaits
+	// the SetSelection that moves the caret behind that text. It is parked here
+	// because the edit session object is released before the key sink, which
+	// holds no lock at that point, runs the SetSelection against the context of
+	// the OnKeyDown call that parked the clone. See placeSelectionAtRangeEnd.
+	pendingCaretRange atomic.Uintptr
 }
 
 func (t *tipImpl) Activate(threadMgr *win32.IUnknown, clientID uint32) win32.HRESULT {
@@ -1292,27 +1298,37 @@ func keySinkOnKeyDown(this uintptr, context uintptr, key uintptr, lParam uintptr
 		// composition are all single-threaded state, and RequestEditSession
 		// blocks until the application accepts the edit session.
 		service.keyMu.Lock()
-		defer service.keyMu.Unlock()
-		if winSpaceBypass(key) {
-			strategyLog("TSF OnKeyDown bypass Win+Space vk=0x%x", key)
-			eat("OnKeyDown", eaten, false)
-			return hresultToUintptr(int32(win32.S_OK))
-		}
-		reply, replied := callCore("keyDown", key, lParam)
-		consume := keyDecision(reply, replied)
-		// The composition is only written for a key the engine keeps, and only
-		// with the context this very callback was handed.
-		if context != 0 {
-			if consume {
-				caret := service.applyComposition(context, reply)
-				service.notifyCandidates(reply, caret)
-			} else {
-				service.forgetComposition(context)
-			}
-		}
+		consume := service.applyKeyLocked(context, key, lParam)
+		// SetSelection moves the caret behind committed text, but it notifies
+		// the application, which can re-enter the TIP through a key callback.
+		// Holding keyMu across that call would deadlock against this very
+		// callback, so the lock is released before the caret is placed.
+		service.keyMu.Unlock()
+		service.placePendingCaret(context)
 		eat("OnKeyDown", eaten, consume)
 		return hresultToUintptr(int32(win32.S_OK))
 	})
+}
+
+// applyKeyLocked runs one key under keyMu and reports whether the TIP kept it.
+func (t *tipImpl) applyKeyLocked(context uintptr, key, lParam uintptr) bool {
+	if winSpaceBypass(key) {
+		strategyLog("TSF OnKeyDown bypass Win+Space vk=0x%x", key)
+		return false
+	}
+	reply, replied := callCore("keyDown", key, lParam)
+	consume := keyDecision(reply, replied)
+	// The composition is only written for a key the engine keeps, and only
+	// with the context this very callback was handed.
+	if context != 0 {
+		if consume {
+			caret := t.applyComposition(context, reply)
+			t.notifyCandidates(reply, caret)
+		} else {
+			t.forgetComposition(context)
+		}
+	}
+	return consume
 }
 
 func keySinkOnKeyUp(this uintptr, _ uintptr, key uintptr, lParam uintptr, eaten uintptr) uintptr {
