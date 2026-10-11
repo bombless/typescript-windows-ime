@@ -12,4 +12,4 @@ DEFINE_GUID(CLSID_TypeScriptWindowsIme,
 DEFINE_GUID(GUID_TypeScriptWindowsImeProfile,
     0xc0a3b5b1, 0x3c52, 0x4e8e, 0xa8, 0xa7, 0x1f, 0x2b, 0x3d, 0x4c, 0x5e, 0x60);
 
-constexpr wchar_t kTypeScriptWindowsImeName[] = L"TypeScript Windows IME";
+constexpr wchar_t kTypeScriptWindowsImeName[] = L"TypeScript Windows IME (C++)";

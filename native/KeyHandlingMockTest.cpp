@@ -273,6 +273,27 @@ int main() {
         ok = Expect(!testKey(VK_DELETE), "delete with no composition must not be consumed in the test pass") && ok;
         ok = Expect(!keyDown(VK_DELETE), "delete with no composition must reach the application") && ok;
 
+        // Simulate physical Ctrl deterministically so this test does not depend on
+        // whether the test runner itself is holding a modifier key.
+        service.SetModifierOverrideForTest(2);
+        const size_t beforeCtrlSpace = core.KeyRequestCount();
+        ok = Expect(!testKey(VK_SPACE), "Ctrl+Space without a composition must not be eaten during test pass") && ok;
+        request = core.LastKeyRequest();
+        ok = Expect(core.KeyRequestCount() == beforeCtrlSpace + 1,
+            "Ctrl+Space test pass must reach the mock core") && ok;
+        ok = Expect(request.find("\"type\":\"testKeyDown\"") != std::string::npos &&
+                    request.find("\"vk\":32") != std::string::npos &&
+                    request.find("\"key\":\" \"") != std::string::npos &&
+                    request.find("\"modifiers\":2") != std::string::npos,
+            "Ctrl+Space test pass must serialize Space and the Ctrl modifier") && ok;
+        ok = Expect(!keyDown(VK_SPACE), "Ctrl+Space without a composition must not be eaten") && ok;
+        request = core.LastKeyRequest();
+        ok = Expect(request.find("\"type\":\"keyDown\"") != std::string::npos &&
+                    request.find("\"vk\":32") != std::string::npos &&
+                    request.find("\"modifiers\":2") != std::string::npos,
+            "Ctrl+Space key-down must serialize the Ctrl modifier") && ok;
+        service.SetModifierOverrideForTest(-1);
+
         // Keys the sink cannot name are neither swallowed nor forwarded. VK_HOME
         // stays outside TextService::KeyName, unlike the F-keys, whose vk values
         // overlap the lowercase letter range.

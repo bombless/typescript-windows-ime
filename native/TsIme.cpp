@@ -745,13 +745,19 @@ bool TestKey(ITfContext*, WPARAM wParam, LPARAM, bool& consume);
     // Lets the adapter tests assert that ActivateEx ran its own body and kept
     // the TF_TMAE_* hints the modern stack passed in.
     DWORD ActivateFlags() const { return activateFlags_; }
+    // KeyEventSink uses narrow wrappers for diagnostic logging.
+    int CurrentModifiers() { return Modifiers(); }
+    static std::string DiagnosticKeyName(WPARAM vk) { return KeyName(vk); }
+    // Deterministic modifier injection for the native mock test; disabled by default.
+    void SetModifierOverrideForTest(int modifiers) { modifierOverrideForTest_ = modifiers; }
 
 private:
     static std::string KeyName(WPARAM vk);
-    static int Modifiers();
+    int Modifiers() const;
 
 bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
                   std::string& response);
+    bool ApplyInputMode(const std::string& response);
     bool ApplyResponse(ITfContext* context, const std::string& response);
     bool UpdateCandidates(ITfContext* context, const std::string& response, RECT caret);
 
@@ -774,6 +780,7 @@ bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
     bool activatedViaEx_;
     std::string lastCandidateResponse_;
     int caretRetriesLeft_ = 0;
+    int modifierOverrideForTest_ = -1;
     RECT lastCaretRect_{};
     ITfComposition* composition_ = nullptr;
 };
@@ -859,6 +866,9 @@ std::string TextService::KeyName(WPARAM vk) {
     case VK_ESCAPE: return "Escape";
     case VK_RETURN: return "Enter";
     case VK_SPACE: return " ";
+    case VK_SHIFT:
+    case VK_LSHIFT:
+    case VK_RSHIFT: return "Shift";
     case VK_LEFT: return "ArrowLeft";
     case VK_UP: return "ArrowUp";
     case VK_RIGHT: return "ArrowRight";
@@ -894,12 +904,19 @@ void TextService::LogActiveProfile(const char* where) const {
     }
     profileMgr->Release();
 }
-int TextService::Modifiers() {
+int TextService::Modifiers() const {
+    if (modifierOverrideForTest_ >= 0) return modifierOverrideForTest_;
+    // TSF may invoke the key sink on a thread whose queued-key state does not
+    // reliably reflect the modifier held by the user. Prefer either view of
+    // the state so Shift+Space is not forwarded as a plain Space key.
+    const auto isDown = [](int vk) {
+        return (GetKeyState(vk) & 0x8000) != 0 || (GetAsyncKeyState(vk) & 0x8000) != 0;
+    };
     int modifiers = 0;
-    if (GetKeyState(VK_SHIFT) & 0x8000) modifiers |= 1;
-    if (GetKeyState(VK_CONTROL) & 0x8000) modifiers |= 2;
-    if (GetKeyState(VK_MENU) & 0x8000) modifiers |= 4;
-    if ((GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000)) modifiers |= 8;
+    if (isDown(VK_SHIFT)) modifiers |= 1;
+    if (isDown(VK_CONTROL)) modifiers |= 2;
+    if (isDown(VK_MENU)) modifiers |= 4;
+    if (isDown(VK_LWIN) || isDown(VK_RWIN)) modifiers |= 8;
     return modifiers;
 }
 
@@ -920,6 +937,8 @@ bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bo
 
     const unsigned int id = nextRequestId_++;
     const unsigned int scanCode = (static_cast<unsigned int>(lParam) >> 16) & 0xff;
+    // Snapshot once so the JSON sent to Node and the diagnostic log cannot disagree.
+    const int modifiers = Modifiers();
     const std::string request =
         std::string("{\"id\":") + std::to_string(id) +
         ",\"session\":" + std::to_string(sessionId_) +
@@ -927,10 +946,21 @@ bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bo
         "\",\"vk\":" + std::to_string(static_cast<unsigned int>(vk)) +
         ",\"scanCode\":" + std::to_string(scanCode) +
         ",\"key\":\"" + JsonEscape(key) +
-        "\",\"modifiers\":" + std::to_string(Modifiers()) + "}";
+        "\",\"modifiers\":" + std::to_string(modifiers) + "}";
 
     NativeLog::Write("CallCore request id=%u session=%llu type=%s vk=0x%02X key=%s modifiers=%d",
-        id, sessionId_, type.c_str(), static_cast<unsigned int>(vk), key.c_str(), Modifiers());
+        id, sessionId_, type.c_str(), static_cast<unsigned int>(vk), key.c_str(), modifiers);
+    if (vk == VK_SPACE) {
+        const bool ctrlSpace = (modifiers & 2) != 0 && (modifiers & (4 | 8)) == 0;
+        NativeLog::Write("SPACE_DIAGNOSTIC type=%s id=%u session=%llu modifiers=%d ctrl=%d shift=%d alt=%d win=%d classifiedCtrlSpace=%d",
+            type.c_str(), id, sessionId_, modifiers, (modifiers & 2) != 0 ? 1 : 0,
+            (modifiers & 1) != 0 ? 1 : 0, (modifiers & 4) != 0 ? 1 : 0,
+            (modifiers & 8) != 0 ? 1 : 0, ctrlSpace ? 1 : 0);
+        if (ctrlSpace) {
+            NativeLog::Write("SHORTCUT Ctrl+Space forwarding to Node: type=%s id=%u session=%llu vk=0x%02X key='%s' modifiers=%d",
+                type.c_str(), id, sessionId_, static_cast<unsigned int>(vk), key.c_str(), modifiers);
+        }
+    }
     if (!pipe_.Call(request, response, id)) {
         NativeLog::Write("CallCore response id=%u failed", id);
         pipe_.Disconnect();
@@ -952,8 +982,41 @@ bool TextService::HandleKey(ITfContext* context, WPARAM wParam, LPARAM lParam, b
     // Shortcut consumption is decided by TypeScript using the forwarded modifiers.
     std::string response;
     if (!CallCore("keyDown", wParam, lParam, consume, response)) return false;
+    if (!ApplyInputMode(response)) NativeLog::Write("HandleKey failed to mirror Node input mode");
     if (consume && context) return ApplyResponse(context, response);
     return true;
+}
+
+bool TextService::ApplyInputMode(const std::string& response) {
+    if (!threadMgr_) return false;
+    const std::string mode = JsonString(response, "mode");
+    if (mode != "chinese" && mode != "english") return true;
+
+    ITfCompartmentMgr* compartments = nullptr;
+    HRESULT hr = threadMgr_->QueryInterface(IID_ITfCompartmentMgr,
+        reinterpret_cast<void**>(&compartments));
+    if (FAILED(hr) || !compartments) {
+        NativeLog::Write("ApplyInputMode QueryInterface(ITfCompartmentMgr) hr=0x%08lX",
+            static_cast<unsigned long>(hr));
+        return false;
+    }
+    ITfCompartment* conversion = nullptr;
+    hr = compartments->GetCompartment(GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, &conversion);
+    compartments->Release();
+    if (FAILED(hr) || !conversion) {
+        NativeLog::Write("ApplyInputMode GetCompartment hr=0x%08lX", static_cast<unsigned long>(hr));
+        return false;
+    }
+
+    VARIANT value;
+    VariantInit(&value);
+    value.vt = VT_I4;
+    value.lVal = mode == "chinese" ? TF_CONVERSIONMODE_NATIVE : 0;
+    hr = conversion->SetValue(clientId_, &value);
+    conversion->Release();
+    NativeLog::Write("ApplyInputMode mode=%s conversion=0x%08lX hr=0x%08lX",
+        mode.c_str(), static_cast<unsigned long>(value.lVal), static_cast<unsigned long>(hr));
+    return SUCCEEDED(hr);
 }
 
 bool TextService::ApplyResponse(ITfContext* context, const std::string& response) {
@@ -1114,11 +1177,25 @@ HRESULT CompositionSink::OnCompositionTerminated(TfEditCookie, ITfComposition*) 
 HRESULT KeyEventSink::OnTestKeyDown(ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
     LogForegroundContext("OnTestKeyDown", context);
     if (!eaten) return E_POINTER;
+    // Capture modifier state at callback entry; TSF dispatch timing can differ from physical key state.
+    const SHORT ctrl = GetKeyState(VK_CONTROL);
+    const SHORT asyncCtrl = GetAsyncKeyState(VK_CONTROL);
+    const SHORT leftCtrl = GetKeyState(VK_LCONTROL);
+    const SHORT asyncLeftCtrl = GetAsyncKeyState(VK_LCONTROL);
+    const SHORT rightCtrl = GetKeyState(VK_RCONTROL);
+    const SHORT asyncRightCtrl = GetAsyncKeyState(VK_RCONTROL);
+    const SHORT shift = GetKeyState(VK_SHIFT);
+    const SHORT alt = GetKeyState(VK_MENU);
+    const int modifiersBefore = service_->CurrentModifiers();
     bool consume = false;
     const bool ok = service_->TestKey(context, wParam, lParam, consume);
     *eaten = ok && consume ? TRUE : FALSE;
-    NativeLog::Write("OnTestKeyDown context=%p vk=0x%02X ok=%d consume=%d eaten=%d",
-        context, static_cast<unsigned int>(wParam), ok ? 1 : 0, consume ? 1 : 0, *eaten ? 1 : 0);
+    const int modifiersAfter = service_->CurrentModifiers();
+    NativeLog::Write("OnTestKeyDown context=%p vk=0x%02X key=%s modifiersBefore=%d modifiersAfter=%d ctrl=0x%04X asyncCtrl=0x%04X leftCtrl=0x%04X asyncLeftCtrl=0x%04X rightCtrl=0x%04X asyncRightCtrl=0x%04X shift=0x%04X alt=0x%04X ok=%d consume=%d eaten=%d",
+        context, static_cast<unsigned int>(wParam), TextService::DiagnosticKeyName(wParam).c_str(), modifiersBefore, modifiersAfter,
+        static_cast<unsigned short>(ctrl), static_cast<unsigned short>(asyncCtrl), static_cast<unsigned short>(leftCtrl),
+        static_cast<unsigned short>(asyncLeftCtrl), static_cast<unsigned short>(rightCtrl), static_cast<unsigned short>(asyncRightCtrl),
+        static_cast<unsigned short>(shift), static_cast<unsigned short>(alt), ok ? 1 : 0, consume ? 1 : 0, *eaten ? 1 : 0);
     return S_OK;
 }
 
@@ -1131,11 +1208,25 @@ HRESULT KeyEventSink::OnTestKeyUp(ITfContext*, WPARAM, LPARAM, BOOL* eaten) {
 HRESULT KeyEventSink::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
     LogForegroundContext("OnKeyDown", context);
     if (!eaten) return E_POINTER;
+    // Capture modifier state at callback entry for comparison with test-key dispatch.
+    const SHORT ctrl = GetKeyState(VK_CONTROL);
+    const SHORT asyncCtrl = GetAsyncKeyState(VK_CONTROL);
+    const SHORT leftCtrl = GetKeyState(VK_LCONTROL);
+    const SHORT asyncLeftCtrl = GetAsyncKeyState(VK_LCONTROL);
+    const SHORT rightCtrl = GetKeyState(VK_RCONTROL);
+    const SHORT asyncRightCtrl = GetAsyncKeyState(VK_RCONTROL);
+    const SHORT shift = GetKeyState(VK_SHIFT);
+    const SHORT alt = GetKeyState(VK_MENU);
+    const int modifiersBefore = service_->CurrentModifiers();
     bool consume = false;
     const bool ok = service_->HandleKey(context, wParam, lParam, consume);
     *eaten = ok && consume ? TRUE : FALSE;
-    NativeLog::Write("OnKeyDown context=%p vk=0x%02X ok=%d consume=%d eaten=%d",
-        context, static_cast<unsigned int>(wParam), ok ? 1 : 0, consume ? 1 : 0, *eaten ? 1 : 0);
+    const int modifiersAfter = service_->CurrentModifiers();
+    NativeLog::Write("OnKeyDown context=%p vk=0x%02X key=%s modifiersBefore=%d modifiersAfter=%d ctrl=0x%04X asyncCtrl=0x%04X leftCtrl=0x%04X asyncLeftCtrl=0x%04X rightCtrl=0x%04X asyncRightCtrl=0x%04X shift=0x%04X alt=0x%04X ok=%d consume=%d eaten=%d",
+        context, static_cast<unsigned int>(wParam), TextService::DiagnosticKeyName(wParam).c_str(), modifiersBefore, modifiersAfter,
+        static_cast<unsigned short>(ctrl), static_cast<unsigned short>(asyncCtrl), static_cast<unsigned short>(leftCtrl),
+        static_cast<unsigned short>(asyncLeftCtrl), static_cast<unsigned short>(rightCtrl), static_cast<unsigned short>(asyncRightCtrl),
+        static_cast<unsigned short>(shift), static_cast<unsigned short>(alt), ok ? 1 : 0, consume ? 1 : 0, *eaten ? 1 : 0);
     return S_OK;
 }
 
