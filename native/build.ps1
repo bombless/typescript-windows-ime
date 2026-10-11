@@ -82,6 +82,12 @@ try {
     # starts its own Host on private pipes, so a real Host keeps running.
     cl.exe /nologo /std:c++17 /EHsc /W4 HostDeadlockTest.cpp /Fe:"$out\HostDeadlockTest.exe" /link user32.lib advapi32.lib
     if ($LASTEXITCODE -ne 0) { throw "HostDeadlockTest.exe failed to build." }
+    # Drives the TSF key sink against a scripted core on a private pipe, so
+    # Backspace/Delete forwarding and consumption can be checked without TSF,
+    # an application, or a running Host. TsIme.cpp is compiled into the test
+    # to reach the key sink, which is why it links like the DLL.
+    cl.exe /nologo /std:c++17 /EHsc /W4 KeyHandlingMockTest.cpp "$out\PipeBridge.obj" /Fe:"$out\KeyHandlingMockTest.exe" /link user32.lib advapi32.lib ole32.lib oleaut32.lib gdi32.lib
+    if ($LASTEXITCODE -ne 0) { throw "KeyHandlingMockTest.exe failed to build." }
     cl.exe /nologo /std:c++17 /EHsc /W4 TsfDiagnose.cpp /Fe:"$out\TsfDiagnose.exe" ole32.lib advapi32.lib
     # Standalone harness for the candidate window: drives CandidateWindow directly
     # and verifies the painted result against a desktop capture, so the window

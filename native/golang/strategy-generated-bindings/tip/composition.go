@@ -286,6 +286,7 @@ func (t *tipImpl) applyReply(context uintptr, reply string) [4]int32 {
 	}
 	if text == "" && !hasCommit {
 		// Nothing to draw and nothing to commit: end what is on screen.
+		strategyLog("StrategyTip applyReply ending empty composition context=%#x previousWritten=%q range=%#x", context, t.writtenComposition(), uintptr(t.composition.Load()))
 		t.endComposition(context, text)
 		return caret
 	}
@@ -512,6 +513,7 @@ func logCompositionRange(r uintptr, units int, when string) {
 // apply performs the composition work with a write cookie in hand.
 func (s *editSessionImpl) apply(ec uintptr) bool {
 	context := s.context
+	strategyLog("StrategyTip editSession apply begin context=%#x ec=%#x text=%q commit=%v previousWritten=%q range=%#x", context, ec, s.text, s.commit, s.service.writtenComposition(), uintptr(s.service.composition.Load()))
 	if context == 0 {
 		return false
 	}
@@ -534,7 +536,9 @@ func (s *editSessionImpl) apply(ec uintptr) bool {
 
 	if s.text == "" {
 		// No composition and no commit: take the composition off the screen.
+		strategyLog("StrategyTip editSession clearing composition context=%#x previousWritten=%q range=%#x", context, s.service.writtenComposition(), uintptr(s.service.composition.Load()))
 		s.service.endCompositionIn(ec)
+		strategyLog("StrategyTip editSession cleared composition context=%#x rangeNow=%#x writtenNow=%q", context, uintptr(s.service.composition.Load()), s.service.writtenComposition())
 		return true
 	}
 
@@ -780,8 +784,11 @@ func foregroundDpi() int {
 // candidate list is open, committed text when a candidate is chosen, and nothing
 // when the composition ends.
 func (t *tipImpl) applyComposition(context uintptr, reply string) [4]int32 {
-	t.compositionContext.Store(context)
+	previous := t.writtenComposition()
 	composition := replyString(reply, "composition")
+	commit := replyString(reply, "commit")
+	strategyLog("StrategyTip applyComposition begin context=%#x composition=%q commit=%q hasCommit=%v previousWritten=%q range=%#x", context, composition, commit, replyHas(reply, "commit"), previous, uintptr(t.composition.Load()))
+	t.compositionContext.Store(context)
 	t.compositionText.Store(composition)
 	if composition != "" {
 		t.compositionTerminated.Store(false)

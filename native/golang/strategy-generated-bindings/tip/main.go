@@ -1025,6 +1025,8 @@ func keyName(vk uintptr) string {
 	switch vk {
 	case 0x08:
 		return "Backspace"
+	case 0x2E:
+		return "Delete"
 	case 0x1B:
 		return "Escape"
 	case 0x0D:
@@ -1316,8 +1318,10 @@ func (t *tipImpl) applyKeyLocked(context uintptr, key, lParam uintptr) bool {
 		strategyLog("TSF OnKeyDown bypass Win+Space vk=0x%x", key)
 		return false
 	}
+	strategyLog("StrategyTip OnKeyDown begin context=%#x vk=0x%x key=%q lParam=0x%x compositionHandle=%#x written=%q", context, key, keyName(key), lParam, uintptr(t.composition.Load()), t.writtenComposition())
 	reply, replied := callCore("keyDown", key, lParam)
 	consume := keyDecision(reply, replied)
+	strategyLog("StrategyTip OnKeyDown reply context=%#x vk=0x%x replied=%v consume=%v reply=%s", context, key, replied, consume, describeReply(reply))
 	// The composition is only written for a key the engine keeps, and only
 	// with the context this very callback was handed.
 	if context != 0 {

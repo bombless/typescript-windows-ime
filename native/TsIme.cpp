@@ -13,12 +13,25 @@
 namespace {
 HRESULT RunComRegistration(bool unregister);
 
+HRESULT GetRangeExtent(ITfRange* range, LONG* start, LONG* length) {
+    if (!range || !start || !length) return E_POINTER;
+    ITfRangeACP* rangeAcp = nullptr;
+    const HRESULT hr = range->QueryInterface(IID_ITfRangeACP, reinterpret_cast<void**>(&rangeAcp));
+    if (FAILED(hr)) return hr;
+    const HRESULT extentHr = rangeAcp->GetExtent(start, length);
+    rangeAcp->Release();
+    return extentHr;
+}
 class TextService;
 
 
 volatile LONG g_serverLocks = 0;
 volatile LONG g_objectCount = 0;
 constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf";
+// Where the text service looks for the core. KeyHandlingMockTest points this
+// at a private pipe so its scripted core cannot race a running Host; nothing
+// in production ever changes it.
+const wchar_t* g_servicePipeName = kPipeName;
 
 // The candidate window asks for the caret rectangle from a timer, so the
 // service that owns the current composition has to be reachable from there.
@@ -340,7 +353,23 @@ HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie ec) override {
 
         if (text_.empty()) {
             if (composition_) {
-                hr = composition_->EndComposition(ec);
+                // Ending a TSF composition does not erase the text it owns.
+                // Clear the range first, or the next composition can be
+                // inserted after stale pinyin (for example, producing "abc").
+                ITfRange* emptyRange = nullptr;
+                hr = composition_->GetRange(&emptyRange);
+                if (SUCCEEDED(hr) && emptyRange) {
+                    hr = emptyRange->SetText(ec, 0, L"", 0);
+                    NativeLog::Write("CompositionEditSession clear-empty SetText hr=0x%08lX",
+                        static_cast<unsigned long>(hr));
+                    emptyRange->Release();
+                } else {
+                    NativeLog::Write("CompositionEditSession clear-empty GetRange failed hr=0x%08lX",
+                        static_cast<unsigned long>(hr));
+                }
+                if (SUCCEEDED(hr)) hr = composition_->EndComposition(ec);
+                NativeLog::Write("CompositionEditSession clear-empty EndComposition hr=0x%08lX",
+                    static_cast<unsigned long>(hr));
                 composition_->Release();
                 composition_ = nullptr;
             }
@@ -397,10 +426,75 @@ HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie ec) override {
         hr = composition_->GetRange(&range);
         if (SUCCEEDED(hr)) {
             const std::wstring wideText = Utf8ToWide(text_);
+            LONG beforeStart = 0, beforeLength = 0;
+            const HRESULT beforeExtentHr = GetRangeExtent(range, &beforeStart, &beforeLength);
+            NativeLog::Write("TSFCommit begin commit=%d textChars=%zu rangeExtentHr=0x%08lX start=%ld length=%ld composition=%p",
+                commit_ ? 1 : 0, wideText.size(), static_cast<unsigned long>(beforeExtentHr),
+                beforeStart, beforeLength, composition_);
             hr = range->SetText(ec, 0, wideText.c_str(), static_cast<LONG>(wideText.size()));
-            if (SUCCEEDED(hr)) ReadCaretRect(ec, range);
+            LONG afterStart = 0, afterLength = 0;
+            const HRESULT afterExtentHr = SUCCEEDED(hr) ? GetRangeExtent(range, &afterStart, &afterLength) : hr;
+            NativeLog::Write("TSFCommit SetText hr=0x%08lX rangeExtentHr=0x%08lX start=%ld length=%ld",
+                static_cast<unsigned long>(hr), static_cast<unsigned long>(afterExtentHr), afterStart, afterLength);
+            if (SUCCEEDED(hr)) {
+                ReadCaretRect(ec, range);
+
+                // SetText replaces the composition text, but relying on the
+                // application's implicit selection update can leave the caret
+                // at the beginning of the newly inserted candidate. Explicitly
+                // place the TSF selection at the end of the updated range.
+                ITfRange* caretRange = nullptr;
+                HRESULT caretHr = range->Clone(&caretRange);
+                if (SUCCEEDED(caretHr) && caretRange) {
+                    caretHr = caretRange->Collapse(ec, TF_ANCHOR_END);
+                    if (SUCCEEDED(caretHr)) {
+                        TF_SELECTION selection{};
+                        selection.range = caretRange;
+                        selection.style.ase = TF_AE_END;
+                        selection.style.fInterimChar = FALSE;
+                        LONG caretStart = 0, caretLength = 0;
+                        const HRESULT caretExtentHr = GetRangeExtent(caretRange, &caretStart, &caretLength);
+                        NativeLog::Write("TSFCommit SetSelection request start=%ld length=%ld extentHr=0x%08lX",
+                            caretStart, caretLength, static_cast<unsigned long>(caretExtentHr));
+                        caretHr = context_->SetSelection(ec, 1, &selection);
+                        NativeLog::Write("TSFCommit SetSelection hr=0x%08lX", static_cast<unsigned long>(caretHr));
+                        TF_SELECTION actualSelection{};
+                        ULONG actualFetched = 0;
+                        const HRESULT getSelectionHr = context_->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &actualSelection, &actualFetched);
+                        LONG actualStart = 0, actualLength = 0;
+                        HRESULT actualExtentHr = E_FAIL;
+                        if (SUCCEEDED(getSelectionHr) && actualFetched == 1 && actualSelection.range) {
+                            actualExtentHr = GetRangeExtent(actualSelection.range, &actualStart, &actualLength);
+                            actualSelection.range->Release();
+                        }
+                        NativeLog::Write("TSFCommit selectionAfterSet hr=0x%08lX fetched=%lu extentHr=0x%08lX start=%ld length=%ld",
+                            static_cast<unsigned long>(getSelectionHr), actualFetched,
+                            static_cast<unsigned long>(actualExtentHr), actualStart, actualLength);
+                    }
+                    caretRange->Release();
+                }
+                if (FAILED(caretHr)) {
+                    NativeLog::Write("CompositionEditSession SetSelection(end) failed hr=0x%08lX",
+                        static_cast<unsigned long>(caretHr));
+                    hr = caretHr;
+                }
+            }
             if (SUCCEEDED(hr) && commit_) {
+                NativeLog::Write("TSFCommit EndComposition begin");
                 hr = composition_->EndComposition(ec);
+                NativeLog::Write("TSFCommit EndComposition hr=0x%08lX", static_cast<unsigned long>(hr));
+                TF_SELECTION finalSelection{};
+                ULONG finalFetched = 0;
+                const HRESULT finalSelectionHr = context_->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &finalSelection, &finalFetched);
+                LONG finalStart = 0, finalLength = 0;
+                HRESULT finalExtentHr = E_FAIL;
+                if (SUCCEEDED(finalSelectionHr) && finalFetched == 1 && finalSelection.range) {
+                    finalExtentHr = GetRangeExtent(finalSelection.range, &finalStart, &finalLength);
+                    finalSelection.range->Release();
+                }
+                NativeLog::Write("TSFCommit selectionAfterEnd hr=0x%08lX fetched=%lu extentHr=0x%08lX start=%ld length=%ld",
+                    static_cast<unsigned long>(finalSelectionHr), finalFetched,
+                    static_cast<unsigned long>(finalExtentHr), finalStart, finalLength);
             }
             range->Release();
         }
@@ -551,7 +645,7 @@ TextService()
         // IPC is optional during activation. TSF activation must remain fast
         // even when the Node/host process is not running yet; key handling
         // will use the short reconnect path below.
-const bool pipeConnected = pipe_.ConnectToServer(kPipeName, 250);
+const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
         NativeLog::Write("TextService::Activate pipe connect=%d", pipeConnected ? 1 : 0);
         g_activeService = this;
         CreateCaretRetryWindow();
@@ -718,6 +812,7 @@ HRESULT KeyEventSink::QueryInterface(REFIID riid, void** object) {
 std::string TextService::KeyName(WPARAM vk) {
     switch (vk) {
     case VK_BACK: return "Backspace";
+    case VK_DELETE: return "Delete";
     case VK_ESCAPE: return "Escape";
     case VK_RETURN: return "Enter";
     case VK_SPACE: return " ";
@@ -774,7 +869,7 @@ bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bo
         return true;
     }
 
-    if (!pipe_.IsConnected() && !pipe_.ConnectToServer(kPipeName, 50)) {
+    if (!pipe_.IsConnected() && !pipe_.ConnectToServer(g_servicePipeName, 50)) {
         NativeLog::Write("CallCore type=%s key=%s pipe unavailable", type.c_str(), key.c_str());
         return false;
     }
@@ -911,7 +1006,7 @@ bool TextService::UpdateCandidates(ITfContext* context, const std::string& respo
         return true;
     }
         std::lock_guard<std::mutex> callLock(callCoreMutex_);
-    if (!pipe_.IsConnected() && !pipe_.ConnectToServer(kPipeName, 50)) return false;
+    if (!pipe_.IsConnected() && !pipe_.ConnectToServer(g_servicePipeName, 50)) return false;
     const unsigned int id = nextRequestId_++;
     const HWND foreground = GetForegroundWindow();
     UINT dpi = foreground ? GetDpiForWindow(foreground) : 0;
@@ -933,7 +1028,7 @@ bool TextService::UpdateCandidates(ITfContext* context, const std::string& respo
 
 void TextService::HideCandidates() {
     std::lock_guard<std::mutex> callLock(callCoreMutex_);
-    if (!pipe_.IsConnected() && !pipe_.ConnectToServer(kPipeName, 50)) return;
+    if (!pipe_.IsConnected() && !pipe_.ConnectToServer(g_servicePipeName, 50)) return;
     const unsigned int id = nextRequestId_++;
     const std::string request = "{\"id\":" + std::to_string(id) + ",\"session\":" + std::to_string(sessionId_) + ",\"type\":\"hideCandidates\"}";
     pipe_.Notify(request);

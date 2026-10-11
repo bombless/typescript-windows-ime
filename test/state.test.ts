@@ -19,6 +19,56 @@ describe("initial key behavior", () => {
     expect(reduceKey({ composition: "abc", selectedCandidate: 0 }, { id: 5, session: 1, type: "keyDown", vk: 27, scanCode: 1, key: "Escape", modifiers: 0 }))
       .toEqual({ state: { composition: "", selectedCandidate: 0 }, consume: true });
   });
+  it("handles Delete by removing the character at the start of the pinyin composition", () => {
+    const key = (state: { composition: string; selectedCandidate: number }, id: number, key: string) =>
+      reduceKey(state, { id, session: 1, type: "keyDown", vk: key === "Delete" ? 0x2e : key.toUpperCase().charCodeAt(0), scanCode: 0, key, modifiers: 0 });
+
+    const w = key(initialImeState(), 1, "w");
+    const cleared = key(w.state, 2, "Delete");
+    expect(cleared).toEqual({ state: { composition: "", selectedCandidate: 0 }, consume: true });
+    expect(key(cleared.state, 3, "o").state.composition).toBe("o");
+
+    const wo = key(key(initialImeState(), 4, "w").state, 5, "o");
+    expect(wo.state.composition).toBe("wo");
+    expect(key(wo.state, 6, "Delete").state.composition).toBe("o");
+  });
+
+  it("regresses mixed character entry, Delete, and Backspace sequences", () => {
+    const key = (state: { composition: string; selectedCandidate: number }, id: number, name: string) =>
+      reduceKey(state, {
+        id, session: 1, type: "keyDown",
+        vk: name === "Backspace" ? 0x08 : name === "Delete" ? 0x2e : name.toUpperCase().charCodeAt(0),
+        scanCode: 0, key: name, modifiers: 0,
+      });
+
+    const run = (sequence: string[], expected: string) => {
+      let state = initialImeState();
+      let id = 1;
+      for (const name of sequence) {
+        const result = key(state, id++, name);
+        expect(result.consume, `key ${name} in sequence ${sequence.join(" ")}`).toBe(true);
+        state = result.state;
+      }
+      expect(state.composition, sequence.join(" ")).toBe(expected);
+    };
+
+    // <a><delete><b> => b
+    run(["a", "Delete", "b"], "b");
+    // <a><b><delete> => b
+    run(["a", "b", "Delete"], "b");
+    // <a><b><backspace> => a
+    run(["a", "b", "Backspace"], "a");
+  });
+
+  it("does not consume Backspace or Delete when the composition is empty", () => {
+    const empty = initialImeState();
+    for (const [id, name, vk] of [[40, "Backspace", 0x08], [41, "Delete", 0x2e]] as const) {
+      expect(reduceKey(empty, {
+        id, session: 1, type: "keyDown", vk, scanCode: 0, key: name, modifiers: 0,
+      })).toEqual({ state: empty, consume: false });
+    }
+  });
+
   it("tests consumption without mutating the core state", async () => {
     const { SimpleEngine } = await import("../src/ime/engine.js");
     const engine = new SimpleEngine();

@@ -13,6 +13,10 @@ export function reduceKey(state: ImeState, event: KeyMessage): Reduction {
     if (!state.composition) return { state, consume: false };
     return { state: { composition: state.composition.slice(0, -1), selectedCandidate: 0 }, consume: true };
   }
+  if (key === "Delete") {
+    if (!state.composition) return { state, consume: false };
+    return { state: { composition: state.composition.slice(1), selectedCandidate: 0 }, consume: true };
+  }
   if (key === "Escape") {
     if (!state.composition) return { state, consume: false };
     return { state: { composition: "", selectedCandidate: 0 }, consume: true };
