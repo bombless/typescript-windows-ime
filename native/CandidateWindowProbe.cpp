@@ -582,10 +582,10 @@ void RunPresentTiming() {
         BitBlt(memory, 0, 0, clientWidth, clientHeight, memory, 0, 0, SRCCOPY);
         SelectObject(memory, oldDirect);
         const unsigned char* pixels = static_cast<const unsigned char*>(bits);
-        for (int y = 0; y < clientHeight; ++y) {
-            for (int x = 0; x < clientWidth; ++x) {
+        for (int pixelY = 0; pixelY < clientHeight; ++pixelY) {
+            for (int pixelX = 0; pixelX < clientWidth; ++pixelX) {
                 const size_t index =
-                    (static_cast<size_t>(y) * clientWidth + static_cast<size_t>(x)) * 4;
+                    (static_cast<size_t>(pixelY) * clientWidth + static_cast<size_t>(pixelX)) * 4;
                 if (MatchesHighlight(&pixels[index])) ++windowHighlight;
                 if (pixels[index] == 0xFF && pixels[index + 1] == 0xFF && pixels[index + 2] == 0xFF) {
                     ++windowWhite;
@@ -872,15 +872,15 @@ SayProcessImage(topProcess, "coversWindow");
         // is reported here even though the candidate window is topmost itself.
         HWND walk = window;
         for (int index = 0; walk && index < 6; ++index) {
-            wchar_t className[128]{};
-            GetClassNameW(walk, className, ARRAYSIZE(className));
-            const LONG_PTR exStyle = GetWindowLongPtrW(walk, GWL_EXSTYLE);
+            wchar_t zOrderClassName[128]{};
+            GetClassNameW(walk, zOrderClassName, ARRAYSIZE(zOrderClassName));
+            const LONG_PTR zOrderExStyle = GetWindowLongPtrW(walk, GWL_EXSTYLE);
             DWORD processId = 0;
             GetWindowThreadProcessId(walk, &processId);
             Say("  zorder[%d] hwnd=%p pid=%lu class=%ls topmost=%d layered=%d norc=%d\n",
-                index, static_cast<void*>(walk), processId, className,
-                (exStyle & WS_EX_TOPMOST) ? 1 : 0, (exStyle & WS_EX_LAYERED) ? 1 : 0,
-                (exStyle & WS_EX_NOREDIRECTIONBITMAP) ? 1 : 0);
+                index, static_cast<void*>(walk), processId, zOrderClassName,
+                (zOrderExStyle & WS_EX_TOPMOST) ? 1 : 0, (zOrderExStyle & WS_EX_LAYERED) ? 1 : 0,
+                (zOrderExStyle & WS_EX_NOREDIRECTIONBITMAP) ? 1 : 0);
             walk = GetWindow(walk, GW_HWNDPREV);
         }
     }
