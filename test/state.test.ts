@@ -3,6 +3,28 @@ import { initialImeState } from "../src/ime/state.js";
 import { reduceKey } from "../src/ime/reducer.js";
 
 describe("initial key behavior", () => {
+  it.each([
+    [0xbc, ",", "，"],
+    [0xbe, ".", "。"],
+    [0xdc, "\\", "、"],
+    [0xe2, "\\", "、"],
+  ])("commits Chinese punctuation for VK %s", (vk, key, expected) => {
+    expect(reduceKey(initialImeState(), {
+      id: 900, session: 1, type: "keyDown", vk, scanCode: 0, key, modifiers: 0,
+    })).toEqual({
+      state: { composition: "", selectedCandidate: 0 },
+      consume: true,
+      commit: expected,
+    });
+  });
+
+  it("passes punctuation through in English mode", () => {
+    const state = { composition: "", selectedCandidate: 0, mode: "english" as const };
+    expect(reduceKey(state, {
+      id: 901, session: 1, type: "keyDown", vk: 0xbc, scanCode: 0, key: ",", modifiers: 0,
+    })).toEqual({ state, consume: false });
+  });
+
   it("consumes alphabetic keyDown events", () => {
     expect(reduceKey(initialImeState(), { id: 1, session: 1, type: "keyDown", vk: 65, scanCode: 30, key: "A", modifiers: 0 }))
       .toEqual({ state: { composition: "a", selectedCandidate: 0 }, consume: true });

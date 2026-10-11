@@ -925,10 +925,8 @@ bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bo
     std::lock_guard<std::mutex> callLock(callCoreMutex_);
     consume = false;
     const std::string key = KeyName(vk);
-    if (key.empty()) {
-        NativeLog::Write("CallCore type=%s ignored vk=0x%02X", type.c_str(), static_cast<unsigned int>(vk));
-        return true;
-    }
+    // Forward unknown keys too: Node.js owns key behavior and can interpret
+    // the virtual-key code even when this native adapter has no display name.
 
     if (!pipe_.IsConnected() && !pipe_.ConnectToServer(g_servicePipeName, 50)) {
         NativeLog::Write("CallCore type=%s key=%s pipe unavailable", type.c_str(), key.c_str());
