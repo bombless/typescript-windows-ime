@@ -26,6 +26,7 @@ export type RequestMessage = HelloMessage | QueryMessage | TestKeyMessage | KeyM
 export interface Candidate { text: string; index: number; annotation?: string; }
 export interface ResponseMessage extends SessionScoped {
   id: number; consume: boolean; composition?: string; commit?: string;
+  mode?: "chinese" | "english";
   candidates?: Candidate[]; selectedCandidate?: number; error?: { code: string; message: string };
 }
 

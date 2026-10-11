@@ -24,6 +24,7 @@ export class SimpleEngine implements ImeEngine {
       session: event.session,
       consume: result.consume,
       composition: result.state.composition,
+      mode: result.state.mode ?? "chinese",
       candidates,
       selectedCandidate: result.state.selectedCandidate,
       ...(result.commit !== undefined ? { commit: result.commit } : {}),

@@ -7,6 +7,17 @@ export interface Reduction { state: ImeState; consume: boolean; commit?: string;
 export function reduceKey(state: ImeState, event: KeyMessage): Reduction {
   if (event.type !== "keyDown") return { state, consume: false };
   const key = event.key;
+  const mode = state.mode ?? "chinese";
+  // A standalone Shift key-down toggles the input mode. TSF mirrors the
+  // returned mode into its compartment; modifier combinations are not toggles.
+  if (key === "Shift" && (event.modifiers & (2 | 4 | 8)) === 0) {
+    return {
+      state: { composition: "", selectedCandidate: 0, mode: mode === "chinese" ? "english" : "chinese" },
+      consume: true,
+    };
+  }
+  // English mode passes ordinary typing to the focused application unchanged.
+  if (mode === "english") return { state, consume: false };
   // Modifier shortcuts belong to Windows/the focused application, not the
   // IME. Native modifier bits are Shift=1, Ctrl=2, Alt=4. Keep this policy in
   // TypeScript so testKeyDown and keyDown agree and shortcuts never mutate state.

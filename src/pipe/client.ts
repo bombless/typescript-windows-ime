@@ -49,8 +49,10 @@ function handleMessage(
       }, state };
     case "testKeyDown":
       return { response: { id: message.id, session, consume: engine.testKey(message, state).consume }, state };
-    case "reset":
-      return { response: { id: message.id, session, consume: false, composition: "" }, state: initialImeState() };
+    case "reset": {
+      const resetState: ImeState = { composition: "", selectedCandidate: 0, ...(state.mode ? { mode: state.mode } : {}) };
+      return { response: { id: message.id, session, consume: false, composition: "", mode: resetState.mode ?? "chinese" }, state: resetState };
+    }
     case "showCandidates":
     case "hideCandidates":
       return { response: { id: message.id, session, consume: false }, state };
@@ -73,6 +75,9 @@ function handleConnection(socket: Socket): void {
     try {
       for (const message of decoder.push(chunk)) {
         logPipe("← C++", message);
+        if ((message.type === "testKeyDown" || message.type === "keyDown") && message.key === "Shift" && (message.modifiers & (2 | 4 | 8)) === 0) {
+          log(`[KEY] received Shift toggle phase=${message.type} session=${message.session} modifiers=${message.modifiers}`);
+        }
         lastSession = message.session;
         const state = sessions.get(message.session) ?? initialImeState();
         const result = handleMessage(message, engine, state);
