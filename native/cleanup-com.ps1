@@ -15,12 +15,15 @@ $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.Wind
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     # Preserve this script's registry-view behavior under elevation, even when
     # the current shell is 32-bit. Capture and return the elevated process code.
-    $elevatedShell = if ([Environment]::Is64BitOperatingSystem) {
-        Join-Path $env:WINDIR "SysNative\WindowsPowerShell\v1.0\powershell.exe"
-    } else {
-        Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+    # SysNative is a filesystem redirection alias for 32-bit callers, not a
+    # normal executable path. Start-Process/CreateProcess cannot reliably launch
+    # it. Prefer the real System32 path; WOW64 redirects it for 32-bit callers.
+    $elevatedShell = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+    if (-not (Test-Path -LiteralPath $elevatedShell)) {
+        $command = Get-Command powershell.exe -ErrorAction SilentlyContinue
+        if ($command) { $elevatedShell = $command.Source }
+        else { throw "Windows PowerShell executable not found. Checked '$elevatedShell' and PATH." }
     }
-    if (-not (Test-Path -LiteralPath $elevatedShell)) { $elevatedShell = "powershell.exe" }
     $arguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath)
     $child = Start-Process -FilePath $elevatedShell -ArgumentList $arguments -Verb RunAs -Wait -PassThru
     exit $child.ExitCode
