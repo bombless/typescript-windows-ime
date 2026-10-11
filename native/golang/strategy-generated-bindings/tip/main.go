@@ -407,6 +407,14 @@ func overlappedResult(handle syscall.Handle, overlapped *syscall.Overlapped) (ui
 	return transferred, nil
 }
 
+// waitForever is the reader's wait. WaitForSingleObject treats a timeout of 0
+// as "poll once", so a 0 passed here would return WAIT_TIMEOUT before the read
+// ever completed: drainPipe would spin on a stalled wait, the bytes the pipe
+// already delivered stay stuck in an abandoned OVERLAPPED, and no reply would
+// ever reach a waiting key callback. Teardown ends this wait with
+// CancelIoEx(pipeHandle, nil), so nothing has to time out for it to stop.
+const waitForever uint32 = 0xffffffff
+
 func waitIO(handle syscall.Handle, overlapped *syscall.Overlapped, event syscall.Handle, timeoutMs uint32) (uint32, error) {
 	wait, err := syscall.WaitForSingleObject(event, timeoutMs)
 	if err != nil {
@@ -420,7 +428,7 @@ func waitIO(handle syscall.Handle, overlapped *syscall.Overlapped, event syscall
 		// stream then resumes in the middle of a line and the reply is torn in
 		// two. Only the write path may cancel; the reader waits for the pipe to
 		// be closed, which CancelIoEx on the whole handle already arranges.
-		if timeoutMs != 0 {
+		if timeoutMs != waitForever {
 			_ = syscall.CancelIoEx(handle, overlapped)
 			_, _ = overlappedResult(handle, overlapped)
 		}
@@ -474,7 +482,7 @@ func readSome(handle syscall.Handle, buffer []byte) (int, error) {
 	var done uint32
 	err = syscall.ReadFile(handle, buffer, &done, &overlapped)
 	if err == syscall.ERROR_IO_PENDING {
-		done, err = waitIO(handle, &overlapped, event, 0)
+		done, err = waitIO(handle, &overlapped, event, waitForever)
 	} else if err == nil && done == 0 {
 		done, err = overlappedResult(handle, &overlapped)
 	}
@@ -919,6 +927,11 @@ type tipImpl struct {
 	compositionContext    atomic.Uintptr
 	compositionText       atomic.Value
 	compositionTerminated atomic.Bool
+	// The text the composition range was last given to write. The range does
+	// not grow with it, so the next write has to replace it by hand, and a
+	// cancel has to clear it. Empty means a composition writing for the first
+	// time, which must still be allowed to overwrite a selection.
+	compositionWritten atomic.Value // string
 }
 
 func (t *tipImpl) Activate(threadMgr *win32.IUnknown, clientID uint32) win32.HRESULT {

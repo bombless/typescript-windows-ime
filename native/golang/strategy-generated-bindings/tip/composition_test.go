@@ -146,3 +146,46 @@ func TestRestoreCandidatesIgnoresNothingRemembered(t *testing.T) {
 	service.shownCandidates.Store("")
 	service.restoreCandidates()
 }
+
+// The range is sized in UTF-16 code units, not bytes and not runes: SetText
+// writes that many units into the document and a composition covering a
+// different count would replace text it does not own.
+func TestUtf16UnitsCountsUTF16CodeUnits(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		text string
+		want int
+	}{
+		{name: "empty", text: "", want: 0},
+		{name: "ascii pinyin", text: "ni", want: 2},
+		{name: "one chinese character", text: "\u4f60", want: 1},
+		{name: "mixed commit", text: "\u4f60ni", want: 3},
+		{name: "astral plane needs a surrogate pair", text: "\U0001f600", want: 2},
+	} {
+		if got := utf16Units(tc.text); got != tc.want {
+			t.Errorf("%s: utf16Units(%q) = %d, want %d", tc.name, tc.text, got, tc.want)
+		}
+	}
+	// A text with an embedded NUL cannot be encoded at all: UTF16FromString
+	// rejects it, so no range may be sized from it.
+	if got := utf16Units("ni\x00"); got != -1 {
+		t.Errorf("utf16Units of text with an embedded NUL = %d, want -1", got)
+	}
+}
+
+func TestWrittenCompositionStartsEmptyAndFollowsEachWrite(t *testing.T) {
+	service := &tipImpl{}
+	if got := service.writtenComposition(); got != "" {
+		t.Errorf("a fresh service has written %q, want nothing", got)
+	}
+	service.storeWrittenComposition("n")
+	if got := service.writtenComposition(); got != "n" {
+		t.Errorf("writtenComposition() = %q, want %q", got, "n")
+	}
+	// Ending or dropping the composition must clear it, otherwise the next
+	// composition would replace text that no longer belongs to it.
+	service.dropComposition()
+	if got := service.writtenComposition(); got != "" {
+		t.Errorf("after dropComposition the service has written %q, want nothing", got)
+	}
+}

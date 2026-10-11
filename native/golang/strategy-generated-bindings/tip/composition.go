@@ -77,6 +77,57 @@ static HRESULT tipRangeCollapse(uintptr_t range, uint32_t ec, int32_t anchor) {
     return r->lpVtbl->Collapse(r, ec, (TfAnchor)anchor);
 }
 
+// Moves the end anchor by a character count. pHalt is NULL: the plain shift is
+// all the composition needs, and pcch still reports how far the anchor really
+// went, which is how a document shorter than the text we wrote shows up.
+static HRESULT tipRangeShiftEnd(uintptr_t range, uint32_t ec, int32_t count, int32_t* shifted) {
+    ITfRange* r = (ITfRange*)(void*)range;
+    LONG cch = 0;
+    HRESULT hr = r->lpVtbl->ShiftEnd(r, ec, count, &cch, NULL);
+    if (shifted) *shifted = (int32_t)cch;
+    return hr;
+}
+
+// Reads where the range sits in the document. ITfRange itself has no extent
+// accessor, only the ACP flavour does, and unlike most of the interface it
+// needs no edit cookie. A context that is not ACP based simply has no extent
+// to report: the caller logs that and carries on.
+static HRESULT tipRangeExtent(uintptr_t range, int32_t* anchor, int32_t* length) {
+    ITfRange* r = (ITfRange*)(void*)range;
+    ITfRangeACP* acp = NULL;
+    HRESULT hr = r->lpVtbl->QueryInterface(r, &IID_ITfRangeACP, (void**)&acp);
+    if (FAILED(hr)) return hr;
+    LONG a = 0;
+    LONG c = 0;
+    hr = acp->lpVtbl->GetExtent(acp, &a, &c);
+    acp->lpVtbl->Release(acp);
+    if (anchor) *anchor = (int32_t)a;
+    if (length) *length = (int32_t)c;
+    return hr;
+}
+
+// Reads back what the range covers. The buffer is one unit larger than the
+// text the caller expects, so a range covering more or less than that cannot
+// hide behind the capacity: pcch comes back as units+1 or less.
+static HRESULT tipRangeText(uintptr_t range, uint32_t ec, wchar_t* buffer, int32_t capacity, int32_t* count) {
+    ITfRange* r = (ITfRange*)(void*)range;
+    ULONG written = 0;
+    HRESULT hr = r->lpVtbl->GetText(r, ec, 0, buffer, (ULONG)capacity, &written);
+    if (count) *count = (int32_t)written;
+    return hr;
+}
+
+// Gravity needs no edit cookie, so it can be read whenever the range exists.
+static HRESULT tipRangeGravity(uintptr_t range, int32_t* gStart, int32_t* gEnd) {
+    ITfRange* r = (ITfRange*)(void*)range;
+    TfGravity start = TF_GRAVITY_BACKWARD;
+    TfGravity end = TF_GRAVITY_BACKWARD;
+    HRESULT hr = r->lpVtbl->GetGravity(r, &start, &end);
+    if (gStart) *gStart = (int32_t)start;
+    if (gEnd) *gEnd = (int32_t)end;
+    return hr;
+}
+
 static HRESULT tipViewGetTextExt(uintptr_t view, uint32_t ec, uintptr_t range, void* rect, int32_t* clipped) {
     ITfContextView* v = (ITfContextView*)(void*)view;
     return v->lpVtbl->GetTextExt(v, ec, (ITfRange*)(void*)range, (RECT*)rect, (BOOL*)clipped);
@@ -106,6 +157,7 @@ import (
 // DoEditSession on this thread before RequestEditSession returns.
 const (
 	tfEsSyncReadWrite = 0x1 | 0x6
+	tfAnchorStart     = 0
 	tfAnchorEnd       = 1
 )
 
@@ -272,6 +324,107 @@ func editSessionDoEditSession(this uintptr, ec uintptr) uintptr {
 	})
 }
 
+// utf16Units is how many UTF-16 code units text occupies in the document,
+// which is the count ITfRange::SetText takes. It is not len(text): a Chinese
+// character is one unit while several bytes in the Go string, and -1 means the
+// text cannot be encoded at all, so no range may be sized from it.
+func utf16Units(text string) int {
+	wide, err := syscall.UTF16FromString(text)
+	if err != nil {
+		return -1
+	}
+	return len(wide) - 1 // UTF16FromString appends the terminator SetText must not receive
+}
+
+// writtenComposition is the text this service last put into the document
+// through the composition range. It is what the next write has to replace and
+// what a cancel has to erase.
+func (t *tipImpl) writtenComposition() string {
+	text, _ := t.compositionWritten.Load().(string)
+	return text
+}
+
+func (t *tipImpl) storeWrittenComposition(text string) {
+	t.compositionWritten.Store(text)
+}
+
+// coverCompositionRange places the range over exactly units UTF-16 code units
+// starting at its own start anchor.
+//
+// A composition range does not grow with the text SetText writes into it: the
+// anchors stay where the composition began, so the range keeps covering
+// nothing while the document grows underneath. SetText on a collapsed range is
+// an insertion, so every keystroke then inserts at the composition start
+// instead of replacing the last one. That is what turned "ni" plus a space
+// into "你nin": "n" was replaced by "ni", "ni" was inserted before it as
+// "n" + "ni" = "nin", and the commit was inserted before that as "你" +
+// "nin". Placing the range over the text first makes each write a replacement
+// of exactly what is on screen, and leaves the range covering what was just
+// written so the caret and the next keystroke agree with it.
+func coverCompositionRange(ec uintptr, r uintptr, units int, when string) bool {
+	if C.tipRangeCollapse(C.uintptr_t(r), C.uint32_t(ec), C.int32_t(tfAnchorStart)) < 0 {
+		strategyLog("StrategyTip %s: collapsing the composition range failed", when)
+		return false
+	}
+	if units <= 0 {
+		return true
+	}
+	var shifted int32
+	if C.tipRangeShiftEnd(C.uintptr_t(r), C.uint32_t(ec), C.int32_t(units),
+		(*C.int32_t)(unsafe.Pointer(&shifted))) < 0 {
+		strategyLog("StrategyTip %s: extending the composition range by %d failed", when, units)
+		return false
+	}
+	if int(shifted) != units {
+		// Short of the request means the document holds less text after the
+		// composition start than the last write left there. Writing anyway
+		// would overwrite text this service does not own.
+		strategyLog("StrategyTip %s: composition range covers %d of %d units", when, shifted, units)
+		return false
+	}
+	return true
+}
+
+// checkCompositionText reads the range back and reports when it does not hold
+// exactly want. The buffer is one unit larger than the expected text, so a
+// range that covers too much or too little cannot look like a match.
+func checkCompositionText(ec uintptr, r uintptr, want string, when string) {
+	units := utf16Units(want)
+	if units < 0 {
+		return
+	}
+	buffer := make([]uint16, units+1)
+	var count int32
+	if C.tipRangeText(C.uintptr_t(r), C.uint32_t(ec),
+		(*C.wchar_t)(unsafe.Pointer(&buffer[0])), C.int32_t(len(buffer)),
+		(*C.int32_t)(unsafe.Pointer(&count))) < 0 {
+		return
+	}
+	if got := syscall.UTF16ToString(buffer[:count]); got != want {
+		strategyLog("StrategyTip %s: composition range holds %q, expected %q", when, got, want)
+	}
+}
+
+// logCompositionRange records where the range sits and which way its anchors
+// face, so a write that lands somewhere unexpected is visible in the log.
+func logCompositionRange(r uintptr, units int, when string) {
+	var gravityStart, gravityEnd int32
+	C.tipRangeGravity(C.uintptr_t(r),
+		(*C.int32_t)(unsafe.Pointer(&gravityStart)), (*C.int32_t)(unsafe.Pointer(&gravityEnd)))
+	var anchor, length int32
+	hr := C.tipRangeExtent(C.uintptr_t(r),
+		(*C.int32_t)(unsafe.Pointer(&anchor)), (*C.int32_t)(unsafe.Pointer(&length)))
+	if hr < 0 {
+		// Not every context exposes an ACP based range; the gravity is still
+		// worth having.
+		strategyLog("StrategyTip %s composition units=%d gravity=%d,%d extent unavailable hr=0x%08x",
+			when, units, gravityStart, gravityEnd, uint32(hr))
+		return
+	}
+	strategyLog("StrategyTip %s composition units=%d extent=%d,%d gravity=%d,%d",
+		when, units, anchor, length, gravityStart, gravityEnd)
+}
+
 // apply performs the composition work with a write cookie in hand.
 func (s *editSessionImpl) apply(ec uintptr) bool {
 	context := s.context
@@ -322,6 +475,7 @@ func (s *editSessionImpl) apply(ec uintptr) bool {
 			return false
 		}
 		s.service.composition.Store(created)
+		s.service.storeWrittenComposition("")
 		composition = created
 		strategyLog("StrategyTip StartComposition ok composition=%#x", composition)
 	}
@@ -333,19 +487,38 @@ func (s *editSessionImpl) apply(ec uintptr) bool {
 		strategyLog("StrategyTip composition GetRange hr=0x%08x", uint32(hr))
 		return false
 	}
+	// Put the range over the text the previous write left behind before it is
+	// replaced. The very first write of a composition has nothing to replace,
+	// and collapsing there would throw away the selection the user asked to
+	// overwrite, so that case writes into the range untouched.
+	if previous := s.service.writtenComposition(); previous != "" {
+		if units := utf16Units(previous); units >= 0 {
+			logCompositionRange(comRange, units, "before SetText")
+			if coverCompositionRange(ec, comRange, units, "before SetText") {
+				checkCompositionText(ec, comRange, previous, "before SetText")
+			}
+		}
+	}
 	wide, err := syscall.UTF16FromString(s.text)
 	if err != nil {
 		comRelease(comRange)
 		strategyLog("StrategyTip composition text is not valid UTF-8: %v", err)
 		return false
 	}
+	units := len(wide) - 1 // the terminator that UTF16FromString appends is not text
 	hr = C.tipRangeSetText(C.uintptr_t(comRange), C.uint32_t(ec),
-		(*C.wchar_t)(unsafe.Pointer(&wide[0])), C.int32_t(len(wide)))
+		(*C.wchar_t)(unsafe.Pointer(&wide[0])), C.int32_t(units))
 	if hr < 0 {
 		strategyLog("StrategyTip range SetText hr=0x%08x", uint32(hr))
 		comRelease(comRange)
 		return false
 	}
+	// Leave the range covering what was just written: the caret, the candidate
+	// window and the next keystroke all read the composition from this range.
+	coverCompositionRange(ec, comRange, units, "after SetText")
+	checkCompositionText(ec, comRange, s.text, "after SetText")
+	logCompositionRange(comRange, units, "after SetText")
+	s.service.storeWrittenComposition(s.text)
 	s.readCaret(ec, context, comRange)
 	comRelease(comRange)
 
@@ -355,6 +528,7 @@ func (s *editSessionImpl) apply(ec uintptr) bool {
 		}
 		comRelease(composition)
 		s.service.composition.Store(0)
+		s.service.storeWrittenComposition("")
 	}
 	return true
 }
@@ -417,6 +591,17 @@ func (t *tipImpl) endCompositionIn(ec uintptr) {
 	var comRange uintptr
 	if C.tipCompositionGetRange(C.uintptr_t(composition),
 		(*C.uintptr_t)(unsafe.Pointer(&comRange))) >= 0 && comRange != 0 {
+		// Place the range over the text that has to go first. Clearing a
+		// collapsed range deletes nothing, which is how the pinyin survived a
+		// cancel that was meant to erase it.
+		if previous := t.writtenComposition(); previous != "" {
+			if units := utf16Units(previous); units >= 0 {
+				logCompositionRange(comRange, units, "before clearing")
+				if coverCompositionRange(ec, comRange, units, "before clearing") {
+					checkCompositionText(ec, comRange, previous, "before clearing")
+				}
+			}
+		}
 		empty := []uint16{0}
 		if C.tipRangeSetText(C.uintptr_t(comRange), C.uint32_t(ec),
 			(*C.wchar_t)(unsafe.Pointer(&empty[0])), 0) < 0 {
@@ -429,6 +614,7 @@ func (t *tipImpl) endCompositionIn(ec uintptr) {
 	}
 	comRelease(composition)
 	t.composition.Store(0)
+	t.storeWrittenComposition("")
 }
 
 // endComposition takes the composition down through its own edit session. The
@@ -452,6 +638,9 @@ func (t *tipImpl) dropComposition() {
 	if composition != 0 {
 		comRelease(composition)
 	}
+	// Whatever was written belongs to a composition that no longer exists, so
+	// the next one starts with nothing to replace.
+	t.storeWrittenComposition("")
 }
 
 // compositionSinkOnTerminated hears about a composition the application ended
