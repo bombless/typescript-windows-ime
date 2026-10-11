@@ -584,7 +584,7 @@ public:
         : refCount_(1), threadMgr_(nullptr), keyMgr_(nullptr), keySink_(nullptr),
           clientId_(TF_CLIENTID_NULL), keySinkAdvised_(false), nextRequestId_(1),
           sessionId_(AllocateSessionId()), pipe_(250), compositionContext_(nullptr),
-          compositionText_(), activateFlags_(0), activatedViaEx_(false) {
+          activateFlags_(0), activatedViaEx_(false) {
         InterlockedIncrement(&g_objectCount);
     }
 
@@ -717,7 +717,7 @@ const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
             composition_->Release();
             composition_ = nullptr;
         }
-compositionText_.clear();
+
         if (g_activeService == this) {
             g_activeService = nullptr;
         }
@@ -768,7 +768,6 @@ bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
     std::mutex callCoreMutex_;
     PipeBridge pipe_;
     ITfContext* compositionContext_;
-    std::string compositionText_;
     // Set by ActivateEx so a regression in either activation path is visible in
     // the log instead of showing up as an unexplained missing key sink.
     DWORD activateFlags_;
@@ -1001,7 +1000,7 @@ if (!context) return false;
             composition_ = nullptr;
         }
         compositionContext_ = nullptr;
-        compositionText_.clear();
+        
         HideCandidates();
         return false;
     }
@@ -1009,7 +1008,7 @@ if (!context) return false;
 if (hasCommit || composition.empty()) {
         HideCandidates();
         compositionContext_ = nullptr;
-        compositionText_.clear();
+        
         if (composition_) {
             composition_->Release();
             composition_ = nullptr;
@@ -1017,7 +1016,6 @@ if (hasCommit || composition.empty()) {
     } else {
         if (!composition_) composition_ = session.DetachComposition();
         compositionContext_ = context;
-        compositionText_ = composition;
         if (!UpdateCandidates(context, response, session.CaretRect())) return false;
     }
     return true;
@@ -1084,8 +1082,8 @@ void TextService::ShowCandidatesForComposition() {
     // caret the last keystroke measured; an empty one is re-probed by the caret
     // retry timer. UpdateCandidates takes callCoreMutex_ itself and hides again
     // when the reply it remembers carries no candidates.
-    NativeLog::Write("ShowCandidatesForComposition compositionBytes=%zu replyBytes=%zu",
-        compositionText_.size(), lastCandidateResponse_.size());
+    NativeLog::Write("ShowCandidatesForComposition replyBytes=%zu",
+        lastCandidateResponse_.size());
     UpdateCandidates(compositionContext_, lastCandidateResponse_, lastCaretRect_);
 }
 
@@ -1095,7 +1093,7 @@ void TextService::OnCompositionTerminated() {
         composition_ = nullptr;
     }
     compositionContext_ = nullptr;
-    compositionText_.clear();
+    
     HideCandidates();
 }
 
