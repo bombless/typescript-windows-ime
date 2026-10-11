@@ -282,6 +282,82 @@ int main() {
             "a key without a name must not be sent to the core") && ok;
     }
 
+    // Adapter contract: XAML/WinUI hosts only ask for IID_ITfTextInputProcessorEx.
+    // A TIP that answers the plain interface alone is skipped by the IME
+    // switcher in Windows Terminal, so both entry points have to resolve and
+    // ActivateEx has to reach the same activation as Activate.
+    {
+        const HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        ok = Expect(SUCCEEDED(hrCom), "the adapter contract checks need COM") && ok;
+
+        TextService service;
+
+        ITfTextInputProcessorEx* asEx = nullptr;
+        const HRESULT hrEx = service.QueryInterface(
+            IID_ITfTextInputProcessorEx, reinterpret_cast<void**>(&asEx));
+        ok = Expect(SUCCEEDED(hrEx) && asEx != nullptr,
+            "the text service must expose IID_ITfTextInputProcessorEx") && ok;
+        if (asEx) asEx->Release();
+
+        ITfTextInputProcessor* asPlain = nullptr;
+        const HRESULT hrPlain = service.QueryInterface(
+            IID_ITfTextInputProcessor, reinterpret_cast<void**>(&asPlain));
+        ok = Expect(SUCCEEDED(hrPlain) && asPlain != nullptr,
+            "the text service must still expose IID_ITfTextInputProcessor") && ok;
+        if (asPlain) asPlain->Release();
+
+        IUnknown* asUnknown = nullptr;
+        ok = Expect(SUCCEEDED(service.QueryInterface(IID_IUnknown,
+                reinterpret_cast<void**>(&asUnknown))) && asUnknown != nullptr,
+            "the text service must expose IID_IUnknown") && ok;
+        if (asUnknown) asUnknown->Release();
+
+        // ActivateEx is what the modern stack calls. It has to run the real
+        // activation, so a null thread manager must fail the same way Activate
+        // does instead of reporting success.
+        ITfTextInputProcessorEx* probe = nullptr;
+        ok = Expect(SUCCEEDED(service.QueryInterface(
+                IID_ITfTextInputProcessorEx, reinterpret_cast<void**>(&probe))) && probe != nullptr,
+            "the extended interface must be reachable for the activation checks") && ok;
+
+        if (probe) {
+            ok = Expect(probe->ActivateEx(nullptr, TF_CLIENTID_NULL, 0) == E_INVALIDARG,
+                "ActivateEx must reject a null thread manager like Activate does") && ok;
+
+            // A real thread manager has to activate and advise the key sink,
+            // which is the only thing the modern stack depends on.
+            ITfThreadMgr* threadMgr = nullptr;
+            const HRESULT hrThreadMgr = CoCreateInstance(CLSID_TF_ThreadMgr, nullptr,
+                CLSCTX_INPROC_SERVER, IID_ITfThreadMgr, reinterpret_cast<void**>(&threadMgr));
+            ok = Expect(SUCCEEDED(hrThreadMgr) && threadMgr != nullptr,
+                "the activation checks need a real thread manager") && ok;
+            if (threadMgr) {
+                const TfClientId clientId = 4242;
+                ok = Expect(SUCCEEDED(probe->ActivateEx(threadMgr, clientId, TF_TMAE_UIELEMENTENABLEDONLY)),
+                    "ActivateEx must succeed against a real thread manager") && ok;
+                ok = Expect(service.ActivateFlags() == TF_TMAE_UIELEMENTENABLEDONLY,
+                    "ActivateEx must keep the flags the modern stack passed in") && ok;
+                // AdviseKeyEventSink needs a client id the document manager has
+                // registered, which a mock host cannot provide, so only the
+                // teardown half of the contract is asserted here.
+                probe->Deactivate();
+                ok = Expect(!service.KeySinkAdvised(),
+                    "Deactivate must unadvise the key event sink") && ok;
+                ok = Expect(service.ActivateFlags() == 0,
+                    "Deactivate must clear the activation flags") && ok;
+                threadMgr->Release();
+            }
+            probe->Release();
+        }
+
+        const IID unsupported = IID_ITfEditSession;
+        void* rejected = reinterpret_cast<void*>(0x1);
+        ok = Expect(service.QueryInterface(unsupported, &rejected) == E_NOINTERFACE && rejected == nullptr,
+            "an unsupported IID must be rejected and clear the output") && ok;
+
+        CoUninitialize();
+    }
+
     if (!ok) return EXIT_FAILURE;
     std::cout << "KeyHandlingMockTest: all tests passed\n";
     return EXIT_SUCCESS;

@@ -574,13 +574,17 @@ private:
     TextService* service_;
 };
 
-class TextService final : public ITfTextInputProcessor {
+// XAML/WinUI hosts (Windows Terminal, modern Store apps) drive the Windows 8+
+// text stack and only ever ask for IID_ITfTextInputProcessorEx. A TIP that
+// exposes the plain ITfTextInputProcessor alone is skipped by the IME switcher
+// in those windows, so the extended interface is not optional here.
+class TextService final : public ITfTextInputProcessorEx {
 public:
-TextService()
+    TextService()
         : refCount_(1), threadMgr_(nullptr), keyMgr_(nullptr), keySink_(nullptr),
           clientId_(TF_CLIENTID_NULL), keySinkAdvised_(false), nextRequestId_(1),
           sessionId_(AllocateSessionId()), pipe_(250), compositionContext_(nullptr),
-          compositionText_() {
+          compositionText_(), activateFlags_(0), activatedViaEx_(false) {
         InterlockedIncrement(&g_objectCount);
     }
 
@@ -592,11 +596,18 @@ TextService()
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
         if (!object) return E_POINTER;
         *object = nullptr;
-        if (riid == IID_IUnknown || riid == IID_ITfTextInputProcessor) {
+        if (riid == IID_IUnknown || riid == IID_ITfTextInputProcessorEx) {
+            *object = static_cast<ITfTextInputProcessorEx*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (riid == IID_ITfTextInputProcessor) {
             *object = static_cast<ITfTextInputProcessor*>(this);
             AddRef();
             return S_OK;
         }
+        NativeLog::Write("TextService::QueryInterface unsupported iid=%08lX-%04X-%04X",
+            static_cast<unsigned long>(riid.Data1), riid.Data2, riid.Data3);
         return E_NOINTERFACE;
     }
 
@@ -654,9 +665,30 @@ const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
         return S_OK;
     }
 
+    HRESULT STDMETHODCALLTYPE ActivateEx(ITfThreadMgr* threadMgr, TfClientId clientId,
+                                         DWORD flags) override {
+        // The candidate list is drawn by the Host process and the edits go
+        // through ITfContext, so the TF_TMAE_* hints (secure mode, 16-bit
+        // hosts, console-only activation) do not change what has to happen
+        // here. Run the same activation so the key sink is advised identically
+        // on both paths.
+        NativeLog::Write("TextService::ActivateEx enter this=%p clientId=%lu flags=0x%08lX secure=%d "
+                         "uielementOnly=%d noActivateTip=%d console=%d wow16=%d",
+            this, static_cast<unsigned long>(clientId), static_cast<unsigned long>(flags),
+            (flags & TF_TMAE_SECUREMODE) ? 1 : 0, (flags & TF_TMAE_UIELEMENTENABLEDONLY) ? 1 : 0,
+            (flags & TF_TMAE_NOACTIVATETIP) ? 1 : 0, (flags & TF_TMAE_CONSOLE) ? 1 : 0,
+            (flags & TF_TMAE_WOW16) ? 1 : 0);
+        const HRESULT hr = Activate(threadMgr, clientId);
+        // Activate runs Deactivate first, so the state is only final here.
+        activateFlags_ = flags;
+        activatedViaEx_ = SUCCEEDED(hr);
+        NativeLog::Write("TextService::ActivateEx result hr=0x%08lX", static_cast<unsigned long>(hr));
+        return hr;
+    }
+
     HRESULT STDMETHODCALLTYPE Deactivate() override {
-        NativeLog::Write("TextService::Deactivate enter this=%p clientId=%lu advised=%d", this,
-            static_cast<unsigned long>(clientId_), keySinkAdvised_ ? 1 : 0);
+        NativeLog::Write("TextService::Deactivate enter this=%p clientId=%lu advised=%d viaEx=%d", this,
+            static_cast<unsigned long>(clientId_), keySinkAdvised_ ? 1 : 0, activatedViaEx_ ? 1 : 0);
         if (keyMgr_ && keySink_ && keySinkAdvised_ && clientId_ != TF_CLIENTID_NULL) {
             const HRESULT hr = keyMgr_->UnadviseKeyEventSink(clientId_);
             NativeLog::Hr("TextService::Deactivate UnadviseKeyEventSink", hr);
@@ -690,6 +722,8 @@ compositionText_.clear();
             g_activeService = nullptr;
         }
         DestroyCaretRetryWindow();
+        activateFlags_ = 0;
+        activatedViaEx_ = false;
         NativeLog::Write("TextService::Deactivate complete this=%p", this);
         return S_OK;
     }
@@ -705,6 +739,12 @@ bool TestKey(ITfContext*, WPARAM wParam, LPARAM, bool& consume);
     // thread, and Deactivate calls Hide before the pipe goes away.
     void HideCandidates();
     void ShowCandidatesForComposition();
+    // Lets the adapter tests assert that both activation paths really advise
+    // the key sink instead of inferring it from log output.
+    bool KeySinkAdvised() const { return keySinkAdvised_; }
+    // Lets the adapter tests assert that ActivateEx ran its own body and kept
+    // the TF_TMAE_* hints the modern stack passed in.
+    DWORD ActivateFlags() const { return activateFlags_; }
 
 private:
     static std::string KeyName(WPARAM vk);
@@ -729,6 +769,10 @@ bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
     PipeBridge pipe_;
     ITfContext* compositionContext_;
     std::string compositionText_;
+    // Set by ActivateEx so a regression in either activation path is visible in
+    // the log instead of showing up as an unexplained missing key sink.
+    DWORD activateFlags_;
+    bool activatedViaEx_;
     std::string lastCandidateResponse_;
     int caretRetriesLeft_ = 0;
     RECT lastCaretRect_{};
@@ -1168,6 +1212,21 @@ HRESULT CreateProfiles(ITfInputProcessorProfiles** profiles) {
     return hr;
 }
 
+// Every category this TIP registers. GUID_TFCAT_TIP_KEYBOARD makes it a keyboard
+// TIP at all; the TIPCAP categories are the capability declarations a host reads
+// before offering the TIP to the user. Classic Win32 hosts like Notepad only
+// need the keyboard category, but packaged/immersive hosts (Windows Terminal,
+// Store apps) and the Win+Space switcher skip a keyboard TIP that does not
+// declare these capabilities, which is why switching worked in Notepad only.
+const GUID kTipCategories[] = {
+    GUID_TFCAT_TIP_KEYBOARD,
+    GUID_TFCAT_TIPCAP_COMLESS,
+    GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
+    GUID_TFCAT_TIPCAP_SECUREMODE,
+    GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
+    GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
+};
+
 HRESULT RegisterTipProfile() {
     NativeLog::Write("RegisterTipProfile begin");
     ITfInputProcessorProfiles* profiles = nullptr;
@@ -1191,9 +1250,14 @@ HRESULT RegisterTipProfile() {
             IID_ITfCategoryMgr, reinterpret_cast<void**>(&categoryMgr));
         NativeLog::Hr("Create ITfCategoryMgr", hr);
         if (SUCCEEDED(hr)) {
-            hr = categoryMgr->RegisterCategory(CLSID_TypeScriptWindowsIme,
-                GUID_TFCAT_TIP_KEYBOARD, CLSID_TypeScriptWindowsIme);
-            NativeLog::Hr("ITfCategoryMgr::RegisterCategory", hr);
+            for (const GUID& catid : kTipCategories) {
+                const HRESULT categoryHr = categoryMgr->RegisterCategory(
+                    CLSID_TypeScriptWindowsIme, catid, CLSID_TypeScriptWindowsIme);
+                if (SUCCEEDED(hr) && FAILED(categoryHr)) hr = categoryHr;
+                NativeLog::Write("RegisterCategory cat=%08lX hr=0x%08lX",
+                    static_cast<unsigned long>(catid.Data1),
+                    static_cast<unsigned long>(categoryHr));
+            }
             categoryMgr->Release();
         }
     }
@@ -1204,6 +1268,25 @@ HRESULT RegisterTipProfile() {
 
 HRESULT UnregisterTipProfile() {
     NativeLog::Write("UnregisterTipProfile begin");
+    // Category metadata is separate from the profile registration, so each
+    // category this TIP registered is removed explicitly. An already absent
+    // category is not an uninstall failure; only the profile Unregister result
+    // decides the outcome.
+    ITfCategoryMgr* categoryMgr = nullptr;
+    HRESULT categoryResult = CoCreateInstance(CLSID_TF_CategoryMgr, nullptr,
+        CLSCTX_INPROC_SERVER, IID_ITfCategoryMgr,
+        reinterpret_cast<void**>(&categoryMgr));
+    NativeLog::Hr("Create ITfCategoryMgr", categoryResult);
+    if (SUCCEEDED(categoryResult)) {
+        for (const GUID& catid : kTipCategories) {
+            const HRESULT result = categoryMgr->UnregisterCategory(
+                CLSID_TypeScriptWindowsIme, catid, CLSID_TypeScriptWindowsIme);
+            NativeLog::Write("UnregisterCategory cat=%08lX hr=0x%08lX",
+                static_cast<unsigned long>(catid.Data1),
+                static_cast<unsigned long>(result));
+        }
+        categoryMgr->Release();
+    }
     ITfInputProcessorProfiles* profiles = nullptr;
     HRESULT hr = CreateProfiles(&profiles);
     if (FAILED(hr)) return hr;

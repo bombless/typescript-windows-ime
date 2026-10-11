@@ -74,6 +74,63 @@ void PrintRegistry(HKEY root, const wchar_t* rootName, REGSAM view, const char* 
     }
 }
 
+// ITfCategoryMgr::RegisterCategory writes a two-way index under the TIP key:
+// Category\Category\{catid}\{item} and Category\Item\{item}\{catid}. The
+// subkeys of Category\Category are the category GUIDs themselves.
+void PrintRegistryCategories(HKEY root, REGSAM view, const char* rootName) {
+    const wchar_t* clsid = L"{7B2E4F5A-3A8E-4D74-9F0B-6D5D6F0E6C41}";
+    const std::wstring key = std::wstring(L"SOFTWARE\\Microsoft\\CTF\\TIP\\") +
+        clsid + L"\\Category\\Category";
+    HKEY handle = nullptr;
+    const LONG openResult = RegOpenKeyExW(root, key.c_str(), 0,
+        KEY_ENUMERATE_SUB_KEYS | view, &handle);
+    if (openResult != ERROR_SUCCESS) {
+        std::printf("REG %s Categories MISSING (win32=%ld)\n", rootName, openResult);
+        return;
+    }
+    const struct { const GUID* catid; const char* name; } known[] = {
+        {&GUID_TFCAT_TIP_KEYBOARD, "KEYBOARD"},
+        {&GUID_TFCAT_TIPCAP_COMLESS, "COMLESS"},
+        {&GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, "IMMERSIVESUPPORT"},
+        {&GUID_TFCAT_TIPCAP_SECUREMODE, "SECUREMODE"},
+        {&GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, "SYSTRAYSUPPORT"},
+        {&GUID_TFCAT_TIPCAP_UIELEMENTENABLED, "UIELEMENTENABLED"},
+    };
+    bool hasImmersiveSupport = false;
+    bool hasComless = false;
+    wchar_t name[64]{};
+    for (DWORD index = 0;; ++index) {
+        DWORD length = ARRAYSIZE(name);
+        const LONG result = RegEnumKeyExW(handle, index, name, &length,
+            nullptr, nullptr, nullptr, nullptr);
+        if (result == ERROR_NO_MORE_ITEMS) break;
+        if (result != ERROR_SUCCESS) {
+            std::printf("REG %s EnumCategory index=%lu win32=%ld\n", rootName,
+                static_cast<unsigned long>(index), result);
+            break;
+        }
+        const std::wstring registered{name};
+        const char* label = "unknown";
+        for (const auto& entry : known) {
+            if (registered != GuidString(*entry.catid)) continue;
+            label = entry.name;
+            if (entry.catid == &GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT) hasImmersiveSupport = true;
+            if (entry.catid == &GUID_TFCAT_TIPCAP_COMLESS) hasComless = true;
+            break;
+        }
+        std::printf("REG %s Category %-18s %ls\n", rootName, label, name);
+    }
+    if (!hasImmersiveSupport) {
+        std::printf("REG %s MISSING GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT:"
+                    " immersive hosts (Windows Terminal) skip this IME\n", rootName);
+    }
+    if (!hasComless) {
+        std::printf("REG %s MISSING GUID_TFCAT_TIPCAP_COMLESS:"
+                    " immersive host activation may fail\n", rootName);
+    }
+    RegCloseKey(handle);
+}
+
 void EnumerateLanguageProfiles(ITfInputProcessorProfiles* profiles, LANGID langid) {
     IEnumTfLanguageProfiles* enumerator = nullptr;
     const HRESULT hr = profiles->EnumLanguageProfiles(langid, &enumerator);
@@ -102,6 +159,21 @@ void CheckComActivation() {
         CLSCTX_INPROC_SERVER, IID_ITfTextInputProcessor, reinterpret_cast<void**>(&tip));
     PrintHr("CoCreateInstance(TypeScriptWindowsIme)", hr);
     if (SUCCEEDED(hr)) tip->Release();
+
+    // XAML/WinUI hosts ask for the extended interface and skip a TIP that only
+    // answers IID_ITfTextInputProcessor, so both have to be reachable.
+    ITfTextInputProcessor* viaEx = nullptr;
+    const HRESULT hrEx = CoCreateInstance(CLSID_TypeScriptWindowsIme, nullptr,
+        CLSCTX_INPROC_SERVER, IID_ITfTextInputProcessorEx, reinterpret_cast<void**>(&viaEx));
+    PrintHr("CoCreateInstance(IID_ITfTextInputProcessorEx)", hrEx);
+    if (SUCCEEDED(hrEx)) {
+        ITfTextInputProcessor* back = nullptr;
+        const HRESULT hrBack = viaEx->QueryInterface(IID_ITfTextInputProcessor,
+            reinterpret_cast<void**>(&back));
+        PrintHr("  ITfTextInputProcessorEx -> ITfTextInputProcessor", hrBack);
+        if (back) back->Release();
+        viaEx->Release();
+    }
 }
 
 void CheckActiveAndDefaultProfiles(ITfInputProcessorProfiles* profiles) {
@@ -147,6 +219,8 @@ int wmain(int argc, wchar_t** argv) {
 
     PrintRegistry(HKEY_LOCAL_MACHINE, L"HKLM", KEY_WOW64_64KEY, "64-bit");
     PrintRegistry(HKEY_CURRENT_USER, L"HKCU", KEY_WOW64_64KEY, "64-bit");
+    PrintRegistryCategories(HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY, "HKLM");
+    PrintRegistryCategories(HKEY_CURRENT_USER, KEY_WOW64_64KEY, "HKCU");
 
     std::printf("\n[TSF PROFILES]\n");
     ITfInputProcessorProfiles* profiles = nullptr;
