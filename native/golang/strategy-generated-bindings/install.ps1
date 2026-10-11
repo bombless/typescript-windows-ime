@@ -204,7 +204,6 @@ if (-not (Test-Path $ctfmon)) { throw "ctfmon.exe was not found at '$ctfmon'." }
 & $cmd /c "taskkill /F /IM ctfmon.exe >nul 2>&1 & start `"`" /D C:\Windows C:\Windows\System32\ctfmon.exe"
 if (-not (Get-Process ctfmon -ErrorAction SilentlyContinue)) { throw "ctfmon.exe did not stay running." }
 Write-Host "Restart the target application and select '$serviceName'."
-Write-Host "This service registers and activates. Switching to it connects to the running TypeScriptWindowsImeHost and asks it to show a probe candidate list. It does not yet handle key events or commit text."
 }
 catch {
     Write-Host $_.Exception.Message
