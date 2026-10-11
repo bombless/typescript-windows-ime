@@ -866,6 +866,8 @@ std::string TextService::KeyName(WPARAM vk) {
     case VK_ESCAPE: return "Escape";
     case VK_RETURN: return "Enter";
     case VK_SPACE: return " ";
+    case VK_OEM_MINUS: return "-";
+    case VK_OEM_PLUS: return "=";
     case VK_SHIFT:
     case VK_LSHIFT:
     case VK_RSHIFT: return "Shift";

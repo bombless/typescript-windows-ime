@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { initialImeState } from "../src/ime/state.js";
 import { reduceKey } from "../src/ime/reducer.js";
+import { getCandidates } from "../src/ime/candidates.js";
 
 describe("initial key behavior", () => {
   it.each([
@@ -180,6 +181,27 @@ describe("initial key behavior", () => {
     const committed = engine.processKey({ id: 33, session: 1, type: "keyDown", vk: 50, scanCode: 0, key: "2", modifiers: 0 }, candidates.state);
     expect(committed.response.commit).toBe(selected);
     expect(committed.state).toEqual({ composition: "", selectedCandidate: 0 });
+  });
+  it("pages candidates with minus/equals and returns the active page", async () => {
+    const { SimpleEngine } = await import("../src/ime/engine.js");
+    const engine = new SimpleEngine();
+    const all = getCandidates("ni");
+    if (all.length <= 9) return;
+    const event = (id: number, key: string, vk: number) => ({
+      id, session: 1, type: "keyDown" as const, vk, scanCode: 0, key, modifiers: 0,
+    });
+    const initial = { composition: "ni", selectedCandidate: 0 };
+    const next = engine.processKey(event(300, "=", 0xbb), initial);
+    expect(next.response.consume).toBe(true);
+    expect(next.state.candidatePage).toBe(1);
+    expect(next.response.candidates?.map((candidate) => candidate.text))
+      .toEqual(all.slice(9, 18).map((candidate) => candidate.text));
+
+    const previous = engine.processKey(event(301, "-", 0xbd), next.state);
+    expect(previous.response.consume).toBe(true);
+    expect(previous.state.candidatePage).toBe(0);
+    expect(previous.response.candidates?.map((candidate) => candidate.text))
+      .toEqual(all.slice(0, 9).map((candidate) => candidate.text));
   });
   it("keeps concurrent sessions from corrupting each other's composition", async () => {
     const { SimpleEngine } = await import("../src/ime/engine.js");

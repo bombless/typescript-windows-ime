@@ -45,12 +45,12 @@ export function reduceKey(state: ImeState, event: KeyMessage): Reduction {
     if (!state.composition) return { state, consume: false };
     return { state: { composition: "", selectedCandidate: 0 }, consume: true };
   }
-  // <-> / PageUp moves to the previous page; <=> / PageDown moves forward.
-  if (["<->", "<=>", "PageUp", "PageDown"].includes(key)) {
+  // Minus moves to the previous page; equals moves forward.
+  if (["-", "="].includes(key)) {
     if (!state.composition || candidates.length <= 9) return { state, consume: false };
     const pageCount = Math.ceil(candidates.length / 9);
     const currentPage = state.candidatePage ?? 0;
-    const delta = key === "<->" || key === "PageUp" ? -1 : 1;
+    const delta = key === "-" ? -1 : 1;
     const candidatePage = Math.max(0, Math.min(pageCount - 1, currentPage + delta));
     if (candidatePage === currentPage) return { state, consume: false };
     return { state: { ...state, candidatePage, selectedCandidate: 0 }, consume: true };
