@@ -1,5 +1,0 @@
-在native\golang做一个当前的dll的替代golang实现
-要使用独立的输入法名字、guid等，这样方便测试两个实现的差异
-让golang版本实现和c++版本的兼容，也去连接host服务
-要更新native\cleanup-com.ps1让它把golang版也清理了
-新增native\install-user-golang.ps1把golang版输入法装进系统
