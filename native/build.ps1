@@ -112,7 +112,7 @@ try {
     $hostExe = Join-Path $out "TypeScriptWindowsImeHost.exe"
     $stagedHost = Join-Path $staging "TypeScriptWindowsImeHost.exe"
     Remove-Item $stagedHost -Force -ErrorAction SilentlyContinue
-    cl.exe /nologo /std:c++17 /EHsc /W4 TypeScriptWindowsImeHost.cpp "$out\CandidateWindow.obj" /Fe:"$stagedHost" /link user32.lib gdi32.lib advapi32.lib
+    cl.exe /nologo /std:c++17 /EHsc /W4 /utf-8 TypeScriptWindowsImeHost.cpp "$out\CandidateWindow.obj" /Fe:"$stagedHost" /link user32.lib gdi32.lib advapi32.lib shell32.lib
     if ($LASTEXITCODE -eq 0) {
         try {
             Move-Item $stagedHost $hostExe -Force

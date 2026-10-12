@@ -3,6 +3,8 @@
 
 #include "PipeBridge.h"
 #include "NativeLog.h"
+#include <ctfutb.h>
+#include <ocidl.h>
 
 #include <new>
 #include <atomic>
@@ -22,6 +24,45 @@ HRESULT GetRangeExtent(ITfRange* range, LONG* start, LONG* length) {
     rangeAcp->Release();
     return extentHr;
 }
+class TextService;
+
+// TSF language-bar item: Node's mode response drives the visible CN/EN label.
+DEFINE_GUID(GUID_TsImeLangBarItem, 0x4f77a7b1, 0x2d31, 0x4c62, 0x91, 0x42, 0x38, 0x1b, 0x9e, 0x50, 0x7c, 0x11);
+class ModeLangBarItem final : public ITfLangBarItemButton, public ITfSource {
+public:
+    ModeLangBarItem() : refs_(1), chinese_(true), sink_(nullptr), cookie_(0) {}
+    ~ModeLangBarItem() { if (sink_) sink_->Release(); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out) return E_POINTER; *out = nullptr;
+        if (iid == IID_IUnknown || iid == IID_ITfLangBarItem || iid == IID_ITfLangBarItemButton) *out = static_cast<ITfLangBarItemButton*>(this);
+        else if (iid == IID_ITfSource) *out = static_cast<ITfSource*>(this); else return E_NOINTERFACE;
+        AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG n=static_cast<ULONG>(InterlockedDecrement(&refs_)); if (!n) delete this; return n; }
+    void SetMode(bool chinese) { if (chinese_ != chinese) { chinese_=chinese; if (sink_) sink_->OnUpdate(TF_LBI_TEXT); } }
+    HRESULT STDMETHODCALLTYPE GetInfo(TF_LANGBARITEMINFO* i) override {
+        if (!i) return E_POINTER; ZeroMemory(i,sizeof(*i)); i->clsidService=CLSID_TypeScriptWindowsIme;
+        i->guidItem=GUID_TsImeLangBarItem; i->dwStyle=TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_BTN_TOGGLE | TF_LBI_STYLE_SHOWNINTRAY;
+        i->ulSort=0; wcsncpy_s(i->szDescription,L"TypeScript Windows IME mode",_TRUNCATE); return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetStatus(DWORD* s) override { if(!s)return E_POINTER; *s=0; return S_OK; }
+    HRESULT STDMETHODCALLTYPE Show(BOOL) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetTooltipString(BSTR* s) override { if(!s)return E_POINTER; *s=SysAllocString(chinese_?L"TypeScript IME - Chinese":L"TypeScript IME - English"); return *s?S_OK:E_OUTOFMEMORY; }
+    HRESULT STDMETHODCALLTYPE OnClick(TfLBIClick,POINT,const RECT*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE InitMenu(ITfMenu*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnMenuSelect(UINT) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetIcon(HICON* i) override { if(!i)return E_POINTER; *i=nullptr; return S_FALSE; }
+    HRESULT STDMETHODCALLTYPE GetText(BSTR* s) override { if(!s)return E_POINTER; *s=SysAllocString(chinese_?L"\u4E2D":L"\u82F1"); return *s?S_OK:E_OUTOFMEMORY; }
+    HRESULT STDMETHODCALLTYPE AdviseSink(REFIID iid,IUnknown* punk,DWORD* cookie) override {
+        if(!punk||!cookie)return E_POINTER; if(iid!=IID_ITfLangBarItemSink)return E_NOINTERFACE;
+        if(sink_)return E_UNEXPECTED; HRESULT hr=punk->QueryInterface(IID_ITfLangBarItemSink,reinterpret_cast<void**>(&sink_));
+        if(SUCCEEDED(hr)){cookie_=1;*cookie=cookie_;} return hr;
+    }
+    HRESULT STDMETHODCALLTYPE UnadviseSink(DWORD cookie) override { if(!sink_||cookie!=cookie_)return E_INVALIDARG; sink_->Release();sink_=nullptr;cookie_=0;return S_OK; }
+private:
+    LONG refs_; bool chinese_; ITfLangBarItemSink* sink_; DWORD cookie_;
+};
 class TextService;
 
 
@@ -584,7 +625,7 @@ public:
         : refCount_(1), threadMgr_(nullptr), keyMgr_(nullptr), keySink_(nullptr),
           clientId_(TF_CLIENTID_NULL), keySinkAdvised_(false), nextRequestId_(1),
           sessionId_(AllocateSessionId()), pipe_(250), compositionContext_(nullptr),
-          activateFlags_(0), activatedViaEx_(false) {
+          activateFlags_(0), activatedViaEx_(false), langBarMgr_(nullptr), langBarItem_(nullptr) {
         InterlockedIncrement(&g_objectCount);
     }
 
@@ -658,6 +699,16 @@ public:
         // will use the short reconnect path below.
 const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
         NativeLog::Write("TextService::Activate pipe connect=%d", pipeConnected ? 1 : 0);
+        HRESULT langHr = threadMgr_->QueryInterface(IID_ITfLangBarItemMgr, reinterpret_cast<void**>(&langBarMgr_));
+        if (SUCCEEDED(langHr) && langBarMgr_) {
+            langBarItem_ = new (std::nothrow) ModeLangBarItem();
+            if (langBarItem_) {
+                langHr = langBarMgr_->AddItem(static_cast<ITfLangBarItemButton*>(langBarItem_));
+                if (FAILED(langHr)) { langBarItem_->Release(); langBarItem_ = nullptr; }
+            }
+        }
+        NativeLog::Write("TextService::Activate language-bar registration hr=0x%08lX item=%p",
+            static_cast<unsigned long>(langHr), langBarItem_);
         g_activeService = this;
         CreateCaretRetryWindow();
         NativeLog::Write("TextService::Activate success this=%p", this);
@@ -702,6 +753,9 @@ const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
             keyMgr_->Release();
             keyMgr_ = nullptr;
         }
+        if (langBarMgr_ && langBarItem_) langBarMgr_->RemoveItem(static_cast<ITfLangBarItemButton*>(langBarItem_));
+        if (langBarItem_) { langBarItem_->Release(); langBarItem_ = nullptr; }
+        if (langBarMgr_) { langBarMgr_->Release(); langBarMgr_ = nullptr; }
         if (threadMgr_) {
             threadMgr_->Release();
             threadMgr_ = nullptr;
@@ -778,6 +832,8 @@ bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
     // the log instead of showing up as an unexplained missing key sink.
     DWORD activateFlags_;
     bool activatedViaEx_;
+    ITfLangBarItemMgr* langBarMgr_;
+    ModeLangBarItem* langBarItem_;
     std::string lastCandidateResponse_;
     int caretRetriesLeft_ = 0;
     int modifierOverrideForTest_ = -1;
@@ -967,7 +1023,11 @@ bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bo
         return false;
     }
     consume = JsonBool(response, "consume", false);
-    NativeLog::Write("CallCore response id=%u consume=%d bytes=%zu", id, consume ? 1 : 0, response.size());
+    // Log receipt of the Node reply and its mode field without logging the full
+    // payload (which may contain user composition text).
+    const std::string responseMode = JsonString(response, "mode");
+    NativeLog::Write("CallCore NODE_REPLY_RECEIVED id=%u consume=%d bytes=%zu mode='%s'",
+        id, consume ? 1 : 0, response.size(), responseMode.empty() ? "<missing>" : responseMode.c_str());
     return true;
 }
 
@@ -988,9 +1048,18 @@ bool TextService::HandleKey(ITfContext* context, WPARAM wParam, LPARAM lParam, b
 }
 
 bool TextService::ApplyInputMode(const std::string& response) {
-    if (!threadMgr_) return false;
     const std::string mode = JsonString(response, "mode");
-    if (mode != "chinese" && mode != "english") return true;
+    NativeLog::Write("ApplyInputMode NODE_MODE_PARSED mode='%s' responseBytes=%zu threadMgr=%d",
+        mode.empty() ? "<missing>" : mode.c_str(), response.size(), threadMgr_ ? 1 : 0);
+    if (mode != "chinese" && mode != "english") {
+        NativeLog::Write("ApplyInputMode NODE_MODE_IGNORED reason=missing-or-unsupported-mode");
+        return true;
+    }
+    if (!threadMgr_) {
+        NativeLog::Write("ApplyInputMode NODE_MODE_RECEIVED_BUT_NOT_APPLIED reason=no-thread-manager mode=%s", mode.c_str());
+        return false;
+    }
+    if (langBarItem_) langBarItem_->SetMode(mode == "chinese");
 
     ITfCompartmentMgr* compartments = nullptr;
     HRESULT hr = threadMgr_->QueryInterface(IID_ITfCompartmentMgr,
@@ -1016,6 +1085,11 @@ bool TextService::ApplyInputMode(const std::string& response) {
     conversion->Release();
     NativeLog::Write("ApplyInputMode mode=%s conversion=0x%08lX hr=0x%08lX",
         mode.c_str(), static_cast<unsigned long>(value.lVal), static_cast<unsigned long>(hr));
+    if (SUCCEEDED(hr)) {
+        const std::string confirmed = "{\"id\":0,\"session\":" + std::to_string(sessionId_) +
+            ",\"type\":\"modeApplied\",\"mode\":\"" + mode + "\"}";
+        if (!pipe_.Notify(confirmed)) NativeLog::Write("ApplyInputMode failed to notify Host of confirmed mode=%s", mode.c_str());
+    }
     return SUCCEEDED(hr);
 }
 
