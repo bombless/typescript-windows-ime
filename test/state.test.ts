@@ -156,6 +156,33 @@ describe("initial key behavior", () => {
       .toBe("a");
   });
 
+  it("commits pending pinyin verbatim when Shift switches to English, then passes later letters through", async () => {
+    const { SimpleEngine } = await import("../src/ime/engine.js");
+    const engine = new SimpleEngine();
+    let state = initialImeState();
+    const key = (id: number, name: string, vk: number, modifiers = 0) => ({
+      id, session: 1, type: "keyDown" as const, vk, scanCode: 0, key: name, modifiers,
+    });
+
+    const a = engine.processKey(key(220, "a", 0x41), state);
+    expect(a.response.consume).toBe(true);
+    expect(a.state.composition).toBe("a");
+    state = a.state;
+
+    const shiftEvent = key(221, "Shift", 0x10, 1);
+    expect(engine.testKey({ ...shiftEvent, type: "testKeyDown" }, state)).toEqual({ consume: true });
+    const shift = engine.processKey(shiftEvent, state);
+    expect(shift.response).toMatchObject({ consume: true, composition: "", commit: "a", mode: "english" });
+    state = shift.state;
+
+    const b = engine.processKey(key(222, "b", 0x42), state);
+    expect(b.response.consume).toBe(false);
+    expect(b.response.commit).toBeUndefined();
+    expect(b.state.mode).toBe("english");
+    expect(b.state.composition).toBe("");
+    // The host inserts the Shift commit ("a"); the unconsumed "b" is typed by the app.
+  });
+
   it("does not toggle out of English mode when Shift types a colon", () => {
     const english = { composition: "", selectedCandidate: 0, mode: "english" as const };
     const shift = reduceKey(english, {

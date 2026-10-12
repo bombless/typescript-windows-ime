@@ -11,9 +11,11 @@ export function reduceKey(state: ImeState, event: KeyMessage): Reduction {
   // A standalone Shift key-down toggles the input mode. TSF mirrors the
   // returned mode into its compartment; modifier combinations are not toggles.
   if (key === "Shift" && (event.modifiers & (2 | 4 | 8)) === 0) {
+    const pendingPinyin = mode === "chinese" ? state.composition : "";
     return {
       state: { composition: "", selectedCandidate: 0, mode: mode === "chinese" ? "english" : "chinese", shiftToggleOrigin: mode },
       consume: true,
+      ...(pendingPinyin ? { commit: pendingPinyin } : {}),
     };
   }
   // Shift is reported as a standalone key before the key it modifies. If
