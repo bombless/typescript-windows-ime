@@ -11,6 +11,14 @@ export interface ImeEngine {
 export class SimpleEngine implements ImeEngine {
   testKey(event: KeyMessage | TestKeyMessage, state: ImeState) {
     const keyEvent: KeyMessage = event.type === "testKeyDown" ? { ...event, type: "keyDown" } : event;
+    // Some TSF applications (including Firefox) skip OnKeyDown when
+    // OnTestKeyDown says a key is not eaten. If Shift was tentatively treated
+    // as a mode toggle from English, allow Shift+; through to OnKeyDown so
+    // reduceKey can restore English mode there. This prediction is pure.
+    if (event.type === "testKeyDown" && state.shiftToggleOrigin === "english" &&
+        (event.modifiers & 1) !== 0 && event.vk === 0xba) {
+      return { consume: true };
+    }
     return { consume: reduceKey(state, keyEvent).consume };
   }
 

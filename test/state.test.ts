@@ -26,6 +26,20 @@ describe("initial key behavior", () => {
     })).toEqual({ state, consume: false });
   });
 
+  it("commits a full-width colon for Shift+semicolon in Chinese mode", () => {
+    const shift = reduceKey(initialImeState(), {
+      id: 902, session: 1, type: "keyDown", vk: 0x10, scanCode: 0x2a, key: "Shift", modifiers: 1,
+    });
+    const colon = reduceKey(shift.state, {
+      id: 903, session: 1, type: "keyDown", vk: 0xba, scanCode: 0x27, key: ";", modifiers: 1,
+    });
+    expect(colon).toEqual({
+      state: { composition: "", selectedCandidate: 0 },
+      consume: true,
+      commit: "：",
+    });
+  });
+
   it("consumes alphabetic keyDown events", () => {
     expect(reduceKey(initialImeState(), { id: 1, session: 1, type: "keyDown", vk: 65, scanCode: 30, key: "A", modifiers: 0 }))
       .toEqual({ state: { composition: "a", selectedCandidate: 0 }, consume: true });
@@ -111,19 +125,54 @@ describe("initial key behavior", () => {
     const toEnglish = toggle(initialImeState(), 200);
     expect(toEnglish.response.consume).toBe(true);
     expect(toEnglish.response.mode).toBe("english");
-    expect(toEnglish.state).toEqual({ composition: "", selectedCandidate: 0, mode: "english" });
+    expect(toEnglish.state).toEqual({ composition: "", selectedCandidate: 0, mode: "english", shiftToggleOrigin: "chinese" });
     expect(engine.testKey({ id: 201, session: 1, type: "testKeyDown", vk: 0x10, scanCode: 0x2a, key: "Shift", modifiers: 1 }, toEnglish.state))
       .toEqual({ consume: true });
 
     const letter = engine.processKey({ id: 202, session: 1, type: "keyDown", vk: 65, scanCode: 30, key: "A", modifiers: 0 }, toEnglish.state);
     expect(letter.response.consume).toBe(false);
-    expect(letter.state).toEqual(toEnglish.state);
+    expect(letter.state).toEqual({ composition: "", selectedCandidate: 0, mode: "english" });
 
     const toChinese = toggle(toEnglish.state, 203);
     expect(toChinese.response.consume).toBe(true);
     expect(toChinese.response.mode).toBe("chinese");
     expect(engine.processKey({ id: 204, session: 1, type: "keyDown", vk: 65, scanCode: 30, key: "A", modifiers: 0 }, toChinese.state).state.composition)
       .toBe("a");
+  });
+
+  it("does not toggle out of English mode when Shift types a colon", () => {
+    const english = { composition: "", selectedCandidate: 0, mode: "english" as const };
+    const shift = reduceKey(english, {
+      id: 210, session: 1, type: "keyDown", vk: 0x10, scanCode: 0x2a, key: "Shift", modifiers: 1,
+    });
+    expect(shift.state.mode).toBe("chinese");
+    const colon = reduceKey(shift.state, {
+      id: 211, session: 1, type: "keyDown", vk: 0xba, scanCode: 0x27, key: ";", modifiers: 1,
+    });
+    expect(colon.consume).toBe(false);
+    expect(colon.state.mode).toBe("english");
+    expect(colon.state.shiftToggleOrigin).toBeUndefined();
+  });
+
+  it("preflights Shift+semicolon so TSF calls keyDown to restore English mode", async () => {
+    const { SimpleEngine } = await import("../src/ime/engine.js");
+    const engine = new SimpleEngine();
+    const english = { composition: "", selectedCandidate: 0, mode: "english" as const };
+    const shift = engine.processKey({
+      id: 212, session: 1, type: "keyDown", vk: 0x10, scanCode: 0x2a, key: "Shift", modifiers: 1,
+    }, english);
+    const colonTest = {
+      id: 213, session: 1, type: "testKeyDown" as const,
+      vk: 0xba, scanCode: 0x27, key: ";", modifiers: 1,
+    };
+
+    expect(engine.testKey(colonTest, shift.state)).toEqual({ consume: true });
+    // Preflight must be side-effect free; actual processing restores English.
+    expect(shift.state.mode).toBe("chinese");
+    const colon = engine.processKey({ ...colonTest, type: "keyDown" }, shift.state);
+    expect(colon.response.consume).toBe(false);
+    expect(colon.response.mode).toBe("english");
+    expect(colon.state.shiftToggleOrigin).toBeUndefined();
   });
 
   it("does not consume unrelated keys or keyUp", () => {

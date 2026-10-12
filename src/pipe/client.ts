@@ -80,8 +80,14 @@ function handleConnection(socket: Socket): void {
         }
         lastSession = message.session;
         const state = sessions.get(message.session) ?? initialImeState();
+        if (message.type === "testKeyDown" || message.type === "keyDown" || message.type === "keyUp") {
+          log(`[IME BEFORE] type=${message.type} session=${message.session} key=${JSON.stringify(message.key)} vk=0x${message.vk.toString(16)} modifiers=${message.modifiers} mode=${state.mode ?? "chinese"} composition=${JSON.stringify(state.composition)} pendingShift=${state.shiftToggleOrigin ?? "none"}`);
+        }
         const result = handleMessage(message, engine, state);
         sessions.set(message.session, result.state);
+        if (message.type === "testKeyDown" || message.type === "keyDown" || message.type === "keyUp") {
+          log(`[IME AFTER] type=${message.type} session=${message.session} key=${JSON.stringify(message.key)} consume=${result.response.consume} mode=${result.state.mode ?? "chinese"} composition=${JSON.stringify(result.state.composition)} pendingShift=${result.state.shiftToggleOrigin ?? "none"} responseMode=${result.response.mode ?? "omitted"}`);
+        }
         const encoded = encodeMessage(result.response);
         logPipe("→ C++", result.response);
         socket.write(encoded);
