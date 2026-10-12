@@ -34,15 +34,16 @@ export function reduceKey(state: ImeState, event: KeyMessage): Reduction {
   // IME. Native modifier bits are Shift=1, Ctrl=2, Alt=4. Keep this policy in
   // TypeScript so testKeyDown and keyDown agree and shortcuts never mutate state.
   if ((event.modifiers & (2 | 4 | 8)) !== 0 ||
-      ((event.modifiers & 1) !== 0 && !/^[A-Za-z]$/.test(key) && event.vk !== 0xba)) {
+      ((event.modifiers & 1) !== 0 && !/^[A-Za-z]$/.test(key) &&
+       event.vk !== 0xba && event.vk !== 0xbc && event.vk !== 0xbe)) {
     return { state, consume: false };
   }
   // Resolve punctuation from the virtual-key code in Node.js. The native TSF
   // layer forwards key events; it does not implement input-method behavior.
   const punctuationByVk: Record<number, string> = { 0xbc: "，", 0xbe: "。", 0xdc: "、", 0xe2: "、" };
-  const punctuation = (event.vk === 0xba && (event.modifiers & 1) !== 0)
-    ? "："
-    : ((event.modifiers & 1) === 0 ? punctuationByVk[event.vk] : undefined);
+  const punctuation = (event.modifiers & 1) !== 0
+    ? ({ 0xba: "：", 0xbc: "《", 0xbe: "》" } as Record<number, string>)[event.vk]
+    : punctuationByVk[event.vk];
   if (punctuation) {
     return { state: { composition: "", selectedCandidate: 0 }, consume: true, commit: punctuation };
   }

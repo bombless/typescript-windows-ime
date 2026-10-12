@@ -40,6 +40,22 @@ describe("initial key behavior", () => {
     });
   });
 
+  it.each([
+    [0xbc, ",", "《"],
+    [0xbe, ".", "》"],
+  ])("commits Chinese angle brackets for Shift+ key VK %s", (vk, key, expected) => {
+    const shift = reduceKey(initialImeState(), {
+      id: 910, session: 1, type: "keyDown", vk: 0x10, scanCode: 0x2a, key: "Shift", modifiers: 1,
+    });
+    expect(reduceKey(shift.state, {
+      id: 911, session: 1, type: "keyDown", vk, scanCode: 0, key, modifiers: 1,
+    })).toEqual({
+      state: { composition: "", selectedCandidate: 0 },
+      consume: true,
+      commit: expected,
+    });
+  });
+
   it("consumes alphabetic keyDown events", () => {
     expect(reduceKey(initialImeState(), { id: 1, session: 1, type: "keyDown", vk: 65, scanCode: 30, key: "A", modifiers: 0 }))
       .toEqual({ state: { composition: "a", selectedCandidate: 0 }, consume: true });
@@ -231,6 +247,16 @@ describe("initial key behavior", () => {
     expect(committed.response.commit).toBe(selected);
     expect(committed.state).toEqual({ composition: "", selectedCandidate: 0 });
   });
+  it("prioritizes custom dictionary entries and de-duplicates Xiaoheilo candidates", () => {
+    const candidates = getCandidates("maohao");
+    const texts = candidates.map((candidate) => candidate.text);
+    expect(texts[0]).toBe("冒号");
+    expect(texts.filter((text) => text === "冒号")).toHaveLength(1);
+    expect(new Set(texts).size).toBe(texts.length);
+    expect(getCandidates("maoha").map((candidate) => candidate.text)).not.toContain("冒号");
+    expect(getCandidates("mao").map((candidate) => candidate.text)).not.toContain("冒号");
+  });
+
   it("pages candidates with minus/equals and returns the active page", async () => {
     const { SimpleEngine } = await import("../src/ime/engine.js");
     const engine = new SimpleEngine();

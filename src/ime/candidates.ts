@@ -3,8 +3,9 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import OpenCC from "opencc-js";
 
-interface Entry { text: string; code: string; weight: number; }
+interface Entry { text: string; code: string; weight: number; priority: number; }
 interface PartialCandidate { text: string; weight: number; }
+const CUSTOM_DICTIONARY_PATH = fileURLToPath(new URL("../../data/custom.dict.yaml", import.meta.url));
 const DICTIONARY_PATH = fileURLToPath(new URL("../../data/pinyin_simp.dict.yaml", import.meta.url));
 const MICROSOFT_DICTIONARY_PATH = fileURLToPath(new URL("../../data/microsoft_pinyin.dict.yaml", import.meta.url));
 // Keep enough results available for candidate paging; the UI displays 9 per page.
@@ -19,10 +20,10 @@ function toUserText(value: string): string {
   return String(toSimplified(value)).replaceAll("妳", "你");
 }
 
-function loadDictionary(path = DICTIONARY_PATH): Map<string, Entry[]> {
+function loadDictionary(path?: string): Map<string, Entry[]> {
   const entries = new Map<string, Entry[]>();
 
-  const addFile = (path: string): void => {
+  const addFile = (path: string, priority: number): void => {
     const source = readFileSync(path, "utf8");
     let inTable = false;
     for (const line of source.split(/\r?\n/)) {
@@ -36,7 +37,7 @@ function loadDictionary(path = DICTIONARY_PATH): Map<string, Entry[]> {
       if (!/^[a-z]+$/.test(code)) continue;
       const rawWeight = columns[2]?.trim() ?? "";
       const weight = rawWeight.endsWith("%") ? 0 : Number.parseFloat(rawWeight);
-      const entry: Entry = { text, code, weight: Number.isFinite(weight) ? weight : 0 };
+      const entry: Entry = { text, code, weight: Number.isFinite(weight) ? weight : 0, priority };
       const addEntry = (key: string, value: Entry): void => {
         const list = entries.get(key) ?? [];
         list.push(value);
@@ -53,16 +54,23 @@ function loadDictionary(path = DICTIONARY_PATH): Map<string, Entry[]> {
     }
   };
 
-  addFile(path);
+  if (path) {
+    addFile(path, 0);
+  } else {
+    addFile(CUSTOM_DICTIONARY_PATH, 0);
+    addFile(DICTIONARY_PATH, 1);
+  }
 
   for (const list of entries.values()) {
-    list.sort((a, b) => b.weight - a.weight);
+    list.sort((a, b) => a.priority - b.priority || b.weight - a.weight);
   }
   return entries;
 }
 
+let customDictionary: Map<string, Entry[]> | undefined;
+function getCustomDictionary(): Map<string, Entry[]> { return customDictionary ??= loadDictionary(CUSTOM_DICTIONARY_PATH); }
 let dictionary: Map<string, Entry[]> | undefined;
-function getDictionary(): Map<string, Entry[]> { return dictionary ??= loadDictionary(); }
+function getDictionary(): Map<string, Entry[]> { return dictionary ??= loadDictionary(DICTIONARY_PATH); }
 let microsoftDictionary: Map<string, Entry[]> | undefined;
 function getMicrosoftDictionary(): Map<string, Entry[]> {
   if (microsoftDictionary) return microsoftDictionary;
@@ -125,6 +133,22 @@ function queryDictionary(composition: string, sourceDictionary: Map<string, Entr
 }
 
 export function getCandidates(composition: string): Candidate[] {
+  const query = normalizeCode(composition);
+  // Custom entries are exact matches only; never use them for composition or prefix suggestions.
+  const custom = (getCustomDictionary().get(query) ?? [])
+    .map((entry) => ({ text: toUserText(entry.text), index: 0, annotation: entry.code }))
+    .filter((candidate, index, list) => list.findIndex((item) => item.text === candidate.text) === index)
+    .slice(0, MAX_CANDIDATES);
   const primary = queryDictionary(composition, getDictionary());
-  return primary.length > 0 ? primary : queryDictionary(composition, getMicrosoftDictionary());
+  const combined = [...custom, ...primary];
+  const seen = new Set<string>();
+  const deduplicated = combined.filter((candidate) => {
+    if (seen.has(candidate.text)) return false;
+    seen.add(candidate.text);
+    return true;
+  });
+  if (deduplicated.length > 0) {
+    return deduplicated.slice(0, MAX_CANDIDATES).map((candidate, index) => ({ ...candidate, index }));
+  }
+  return queryDictionary(composition, getMicrosoftDictionary());
 }

@@ -1,0 +1,7 @@
+# Custom user dictionary. Entries here take priority over pinyin_simp.dict.yaml.
+---
+name: custom
+version: "0.1"
+sort: by_weight
+...
+冒号	mao hao	100000
