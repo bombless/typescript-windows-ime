@@ -1,0 +1,53 @@
+name: Build Windows MSI
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, "feat/msi-autostart"]
+    paths:
+      - "installer/**"
+      - "native/**"
+      - "src/**"
+      - "package*.json"
+      - ".github/workflows/build-msi.yml"
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: microsoft/setup-msbuild@v2
+      - name: Install dependencies
+        run: npm ci
+      - name: Test TypeScript
+        run: |
+          npm test
+          npm run build
+      - name: Build native TSF and Host
+        shell: pwsh
+        run: |
+          ./native/build.ps1
+          New-Item -ItemType Directory -Force native/install | Out-Null
+          Copy-Item native/build/TypeScriptWindowsIme.dll native/install/TypeScriptWindowsIme.dll
+          Copy-Item native/build/TypeScriptWindowsImeHost.exe native/install/TypeScriptWindowsImeHost.exe
+      - name: Prepare MSI payload
+        shell: pwsh
+        run: ./installer/build-payload.ps1
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          wix build installer/Product.wxs -arch x64 -d ProductVersion=$env:GITHUB_RUN_NUMBER.0.0 -d PayloadDir="$env:GITHUB_WORKSPACE\artifacts\payload" -o "$env:GITHUB_WORKSPACE\artifacts\TypeScriptWindowsIme.msi"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TypeScriptWindowsIme-MSI
+          path: artifacts/TypeScriptWindowsIme.msi
+          if-no-files-found: error
