@@ -11,4 +11,4 @@ New-Item -ItemType Directory -Force -Path (Join-Path $payload 'native\install') 
 Copy-Item (Join-Path $root 'native\install\TypeScriptWindowsIme.dll') (Join-Path $payload 'native\install\TypeScriptWindowsIme.dll') -ErrorAction Stop
 Copy-Item (Join-Path $root 'native\install\TypeScriptWindowsImeHost.exe') (Join-Path $payload 'native\install\TypeScriptWindowsImeHost.exe') -ErrorAction Stop
 Push-Location $payload
-try { npm ci --omit=dev; if ($LASTEXITCODE -ne 0) { throw 'npm ci --omit=dev failed' } } finally { Pop-Location }
+try { npm ci; if ($LASTEXITCODE -ne 0) { throw 'npm ci --omit=dev failed' } } finally { Pop-Location }
