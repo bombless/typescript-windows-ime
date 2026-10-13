@@ -134,11 +134,13 @@ try {
     cl.exe /nologo /std:c++17 /EHsc /W4 /LD TsIme.cpp "$out\PipeBridge.obj" /link /OUT:"$stagedDll" /IMPLIB:"$stagedLib" /DEF:"TsIme.def" /SUBSYSTEM:WINDOWS advapi32.lib ole32.lib oleaut32.lib user32.lib gdi32.lib
     if ($LASTEXITCODE -ne 0) { throw "Failed to link TypeScriptWindowsIme.dll." }
 
-    try {
-        Remove-Item $dll -Force -ErrorAction Stop
-    } catch {
-        Remove-Item $stagedDll, $stagedLib, $stagedExp -Force -ErrorAction SilentlyContinue
-        throw "Cannot replace $dll. The existing DLL is probably loaded by a TSF host. Disable the TypeScript Windows IME or restart the affected application, then run build.ps1 again. Original error: $($_.Exception.Message)"
+    if (Test-Path $dll) {
+        try {
+            Remove-Item $dll -Force -ErrorAction Stop
+        } catch {
+            Remove-Item $stagedDll, $stagedLib, $stagedExp -Force -ErrorAction SilentlyContinue
+            throw "Cannot replace $dll. The existing DLL may be locked by a TSF host. Disable the TypeScript Windows IME or restart the affected application, then run build.ps1 again. Original error: $($_.Exception.Message)"
+        }
     }
 
     Move-Item $stagedDll $dll -Force
