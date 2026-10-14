@@ -80,7 +80,8 @@ function handleConnection(socket: Socket): void {
           log(`[KEY] received Shift toggle phase=${message.type} session=${message.session} modifiers=${message.modifiers}`);
         }
         lastSession = message.session;
-        if (message.type === "hello") {
+        const isNewSession = !sessions.has(message.session);
+        if (message.type === "hello" || isNewSession) {
           runActivationScripts({ type: "activate", session: message.session, pid: process.pid, timestamp: new Date().toISOString() });
         }
         const state = sessions.get(message.session) ?? initialImeState();

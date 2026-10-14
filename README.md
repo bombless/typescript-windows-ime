@@ -37,6 +37,10 @@ running Host never blocks `build.ps1` with LNK1104.
 
 Phase 0/1 deliberately keeps behavior small: alphabetic `keyDown` events produce a lowercase composition; the native adapter remains responsible for Windows TSF/COM concerns.
 
+## Chinese / English mode
+
+Press **Shift** by itself to toggle between Chinese pinyin input and English pass-through. The mode is owned by the per-session TypeScript IME state and returned in each key response. In English mode, ordinary keys are not consumed by the IME and go to the focused application. The native TSF adapter only mirrors the returned mode to `GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION` so Windows can reflect the current conversion mode in its language/input indicator. Resetting a composition preserves the selected mode.
+
 ## Candidate window
 
 `native\CandidateWindow.cpp` draws the candidate list itself. Most applications
