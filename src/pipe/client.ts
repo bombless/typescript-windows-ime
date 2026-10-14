@@ -5,6 +5,7 @@ import { SimpleEngine } from "../ime/engine.js";
 import { getCandidates } from "../ime/candidates.js";
 import { initialImeState, type ImeState } from "../ime/state.js";
 import { appendFileSync } from "node:fs";
+import { runActivationScripts } from "../automation.js";
 
 export const PIPE_NAME = "\\\\.\\pipe\\TypeScriptWindowsIME.Host";
 
@@ -79,6 +80,22 @@ function handleConnection(socket: Socket): void {
           log(`[KEY] received Shift toggle phase=${message.type} session=${message.session} modifiers=${message.modifiers}`);
         }
         lastSession = message.session;
+        const isNewSession = !sessions.has(message.session);
+        if (message.type === "hello" || isNewSession) {
+          const activationEvent: import("../automation.js").ActivationEvent = {
+            type: "activate", session: message.session, pid: process.pid, timestamp: new Date().toISOString(),
+            ...(message.type === "hello" && message.clientPid ? { clientPid: message.clientPid } : {}),
+            ...(message.type === "hello" && message.clientImage ? { clientImage: message.clientImage } : {}),
+          };
+          runActivationScripts(activationEvent);
+        }
+        if (message.type === "hello" && message.id === 0) {
+          // Synthetic notification from Host; Host does not expect a response for id 0.
+          if (!sessions.has(message.session)) {
+            sessions.set(message.session, initialImeState());
+          }
+          continue;
+        }
         const state = sessions.get(message.session) ?? initialImeState();
         if (message.type === "testKeyDown" || message.type === "keyDown" || message.type === "keyUp") {
           log(`[IME BEFORE] type=${message.type} session=${message.session} key=${JSON.stringify(message.key)} vk=0x${message.vk.toString(16)} modifiers=${message.modifiers} mode=${state.mode ?? "chinese"} composition=${JSON.stringify(state.composition)} pendingShift=${state.shiftToggleOrigin ?? "none"}`);

@@ -8,7 +8,7 @@ export const MAX_MESSAGE_BYTES = 16 * 1024;
 // composition state per session so apps cannot corrupt each other.
 export interface SessionScoped { session: number; }
 
-export interface HelloMessage extends SessionScoped { id: number; type: "hello"; protocol: number; }
+export interface HelloMessage extends SessionScoped { id: number; type: "hello"; protocol: number; clientPid?: number; clientImage?: string; }
 export interface QueryMessage extends SessionScoped { id: number; type: "query"; composition: string; }
 export interface TestKeyMessage extends SessionScoped {
   id: number; type: "testKeyDown"; vk: number; scanCode: number; key: string; modifiers: number;

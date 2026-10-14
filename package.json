@@ -10,6 +10,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "tsx src/index.ts",
+    "cli": "tsx src/cli.ts",
     "host": "powershell -NoProfile -ExecutionPolicy Bypass -File native\\install-host.ps1",
     "start": "node dist/index.js"
   },
