@@ -82,7 +82,19 @@ function handleConnection(socket: Socket): void {
         lastSession = message.session;
         const isNewSession = !sessions.has(message.session);
         if (message.type === "hello" || isNewSession) {
-          runActivationScripts({ type: "activate", session: message.session, pid: process.pid, timestamp: new Date().toISOString() });
+          const activationEvent: import("../automation.js").ActivationEvent = {
+            type: "activate", session: message.session, pid: process.pid, timestamp: new Date().toISOString(),
+            ...(message.type === "hello" && message.clientPid ? { clientPid: message.clientPid } : {}),
+            ...(message.type === "hello" && message.clientImage ? { clientImage: message.clientImage } : {}),
+          };
+          runActivationScripts(activationEvent);
+        }
+        if (message.type === "hello" && message.id === 0) {
+          // Synthetic notification from Host; Host does not expect a response for id 0.
+          if (!sessions.has(message.session)) {
+            sessions.set(message.session, initialImeState());
+          }
+          continue;
         }
         const state = sessions.get(message.session) ?? initialImeState();
         if (message.type === "testKeyDown" || message.type === "keyDown" || message.type === "keyUp") {

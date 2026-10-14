@@ -3,7 +3,7 @@ import { resolve, isAbsolute, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
-export interface ActivationEvent { type: "activate"; session: number; pid: number; timestamp: string; }
+export interface ActivationEvent { type: "activate"; session: number; pid: number; timestamp: string; clientPid?: number; clientImage?: string; }
 export interface ScriptEntry { name: string; path: string; }
 
 const configPath = () => resolve(process.cwd(), ".ime-scripts.json");

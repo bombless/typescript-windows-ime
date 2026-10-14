@@ -9,17 +9,17 @@ try {
   activation = { rawEvent };
 }
 
+const clientImage = activation.clientImage ?? null;
+const appName = clientImage ? clientImage.split(/[/\\]/).pop() ?? null : null;
+
 const record = {
   loggedAt: new Date().toISOString(),
   event: "ime-activate",
+  session: activation.session,
+  appName,
+  clientPid: activation.clientPid ?? null,
+  clientImage,
   activation,
-  process: {
-    pid: process.pid,
-    ppid: process.ppid,
-    executable: process.execPath,
-    argv: process.argv,
-    cwd: process.cwd(),
-  },
 };
 
 appendFileSync(resolve(process.cwd(), "run.log"), JSON.stringify(record) + "\n", "utf8");

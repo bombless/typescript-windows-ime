@@ -6,6 +6,10 @@ describe("JSONL protocol", () => {
     const message = { id: 2, session: 7, type: "keyDown" as const, vk: 65, scanCode: 30, key: "A", modifiers: 0 };
     expect(decodeRequestLine(encodeMessage(message).trim())).toEqual(message);
   });
+  it("round-trips a hello event with client application info", () => {
+    const message = { id: 0, session: 7, type: "hello" as const, protocol: 3, clientPid: 1234, clientImage: "C:\\Windows\\notepad.exe" };
+    expect(decodeRequestLine(encodeMessage(message).trim())).toEqual(message);
+  });
   it("round-trips candidate rendering notifications", () => {
     const show = { id: 5, session: 7, type: "showCandidates" as const, candidates: ["你好", "世界"], selection: 1,
       caret: { left: 10, top: 20, right: 11, bottom: 40 }, dpi: 144 };

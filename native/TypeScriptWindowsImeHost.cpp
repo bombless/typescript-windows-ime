@@ -312,6 +312,38 @@ bool ReadSessionId(const std::string& line, unsigned long long& session) {
     return true;
 }
 
+std::string JsonEscapeHost(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 8);
+    for (const unsigned char c : value) {
+        switch (c) {
+        case '\\': out += "\\\\"; break;
+        case '"': out += "\\\""; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (c < 0x20) out += '?';
+            else out += static_cast<char>(c);
+            break;
+        }
+    }
+    return out;
+}
+
+std::string GetProcessImageByPid(DWORD pid) {
+    if (!pid) return "";
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return "";
+    wchar_t image[MAX_PATH]{};
+    DWORD imageLength = ARRAYSIZE(image);
+    QueryFullProcessImageNameW(process, 0, image, &imageLength);
+    CloseHandle(process);
+    char imageUtf8[MAX_PATH * 3]{};
+    WideCharToMultiByte(CP_UTF8, 0, image, -1, imageUtf8, sizeof(imageUtf8), nullptr, nullptr);
+    return imageUtf8;
+}
+
 std::string MessageType(const std::string& line) {
     const std::string needle = "\"type\":\"";
     const size_t pos = line.find(needle);
@@ -511,6 +543,31 @@ void ServeTsfClient(HANDLE pipe) {
             registered = true;
             NativeLog::Write("Host TSF session active session=%llu pipe=%p clients=%zu",
                 session, pipe, g_tsfClients.size());
+
+            // Synthesize a hello message so Node knows which application
+            // activated the input method. The TSF DLL is loaded in-process,
+            // so GetNamedPipeClientProcessId gives us the application PID.
+            ULONG clientPid = 0;
+            GetNamedPipeClientProcessId(pipe, &clientPid);
+            std::string clientImage = GetProcessImageByPid(clientPid);
+            NativeLog::Write("Host TSF hello synthesized session=%llu clientPid=%lu image=%s",
+                session, static_cast<unsigned long>(clientPid),
+                clientImage.empty() ? "<unknown>" : clientImage.c_str());
+            std::string hello = "{\"id\":0,\"session\":" + std::to_string(session)
+                + ",\"type\":\"hello\",\"protocol\":3"
+                + ",\"clientPid\":" + std::to_string(clientPid)
+                + ",\"clientImage\":\"" + JsonEscapeHost(clientImage) + "\"}";
+            HANDLE node = INVALID_HANDLE_VALUE;
+            {
+                // g_clientsMutex already held by the outer lock_guard
+                node = g_nodeClient;
+            }
+            if (node != INVALID_HANDLE_VALUE) {
+                std::lock_guard<std::mutex> writeLock(g_nodeWriteMutex);
+                if (!WriteLine(node, hello)) {
+                    NativeLog::Write("Host failed to forward hello session=%llu", session);
+                }
+            }
         }
 
         NativeLog::Write("Host TSF request session=%llu type=%s bytes=%zu",
