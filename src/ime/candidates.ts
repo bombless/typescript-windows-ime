@@ -93,12 +93,17 @@ function queryDictionary(composition: string, sourceDictionary: Map<string, Entr
     const toCandidate = (entry: Entry, index: number): Candidate => ({
       text: toUserText(entry.text), index, annotation: entry.code,
     });
-    const exactSingleCharacters = exact.filter((entry) => [...toUserText(entry.text)].length === 1);
-    const singleCharacterEntries = exactSingleCharacters.length > 0
-      ? exactSingleCharacters
-      : [...sourceDictionary.entries()]
-        .filter(([code]) => code.startsWith(query))
-        .flatMap(([, entries]) => entries.filter((entry) => [...toUserText(entry.text)].length === 1));
+    // A one-letter query (e.g. "d") is an initials search, not an exact
+    // syllable lookup. Merge single-character entries from every matching
+    // full-pinyin syllable and rank them globally by dictionary frequency;
+    // otherwise an early initials alias can suppress high-frequency entries
+    // such as 的 (de) before the result limit is applied.
+    const singleCharacterEntries = [...sourceDictionary.entries()]
+      .filter(([code]) => code.startsWith(query))
+      .flatMap(([, entries]) => entries.filter((entry) =>
+        !entry.isInitials && [...toUserText(entry.text)].length === 1,
+      ))
+      .sort((a, b) => b.weight - a.weight || a.priority - b.priority || a.code.localeCompare(b.code));
     const seenSingleCharacters = new Set<string>();
     const singleCharacterCandidates = singleCharacterEntries
       .map(toCandidate)
@@ -224,5 +229,46 @@ export function getCandidates(composition: string): Candidate[] {
   if (deduplicated.length > 0) {
     return deduplicated.slice(0, MAX_CANDIDATES).map((candidate, index) => ({ ...candidate, index }));
   }
-  return queryDictionary(composition, getMicrosoftDictionary());
+
+  const microsoft = queryDictionary(composition, getMicrosoftDictionary());
+  if (microsoft.length > 0) return microsoft;
+
+  // Incremental continuation fallback: when the whole input has no candidates,
+  // reuse candidates for the longest matching prefix and append single-character
+  // candidates for the remaining letters. Example: "houxuank" can extend the
+  // useful "houxuan" candidates with characters available for "k".
+  const traceEnabled = process.env.IME_CANDIDATE_TRACE === "1";
+  for (let split = query.length - 1; split >= 1; split--) {
+    const prefix = query.slice(0, split);
+    const suffix = query.slice(split);
+    const prefixCandidates = getCandidates(prefix);
+    if (prefixCandidates.length === 0) continue;
+
+    const suffixCandidates = queryDictionary(suffix, getDictionary())
+      .filter((candidate) => [...candidate.text].length === 1);
+    if (suffixCandidates.length === 0) continue;
+
+    const seenCombined = new Set<string>();
+    const combinedCandidates: Candidate[] = [];
+    for (const left of prefixCandidates) {
+      for (const right of suffixCandidates) {
+        const text = left.text + right.text;
+        if (seenCombined.has(text)) continue;
+        seenCombined.add(text);
+        combinedCandidates.push({ text, index: combinedCandidates.length });
+        if (combinedCandidates.length >= MAX_CANDIDATES) break;
+      }
+      if (combinedCandidates.length >= MAX_CANDIDATES) break;
+    }
+    if (combinedCandidates.length > 0) {
+      if (traceEnabled) {
+        console.log(`[ime-candidates] query=${query} resultMode=prefix-plus-single-char prefix=${prefix} prefixCount=${prefixCandidates.length} suffix=${suffix} suffixSingleChars=${suffixCandidates.length} combined=${combinedCandidates.length}`);
+        for (const candidate of combinedCandidates.slice(0, 12)) {
+          console.log(`[ime-candidates] continued=${JSON.stringify(candidate.text)}`);
+        }
+      }
+      return combinedCandidates.map((candidate, index) => ({ ...candidate, index }));
+    }
+  }
+  return [];
 }

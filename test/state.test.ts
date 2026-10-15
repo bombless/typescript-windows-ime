@@ -287,6 +287,12 @@ describe("initial key behavior", () => {
     expect(candidates.every((candidate) => [...candidate.text].length === 1)).toBe(true);
   });
 
+  it("ranks high-frequency single characters across syllables for one-letter input", () => {
+    const candidates = getCandidates("d").map((candidate) => candidate.text);
+    expect(candidates.indexOf("的")).toBeGreaterThanOrEqual(0);
+    expect(candidates.indexOf("的")).toBeLessThan(9);
+  });
+
   it("does not compose full pinyin from internal initials aliases", () => {
     const candidates = getCandidates("lianx").map((candidate) => candidate.text);
     expect(candidates).toContain("联系");
@@ -299,6 +305,14 @@ describe("initial key behavior", () => {
     expect(candidates[0]).toBe("项目");
     expect(candidates).not.toContain("想呒");
     expect(candidates).not.toContain("下嗯呒");
+  });
+
+  it("extends a valid prefix with single-character candidates when the full input has no match", () => {
+    const prefix = getCandidates("houxuan").map((candidate) => candidate.text);
+    const continued = getCandidates("houxuank").map((candidate) => candidate.text);
+    expect(prefix.length).toBeGreaterThan(0);
+    expect(continued.length).toBeGreaterThan(0);
+    expect(continued.some((text) => prefix.some((candidate) => text.startsWith(candidate) && [...text].length > [...candidate].length))).toBe(true);
   });
 
   it("prioritizes custom dictionary entries and de-duplicates Xiaoheilo candidates", () => {
