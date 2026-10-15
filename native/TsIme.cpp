@@ -922,6 +922,9 @@ std::string TextService::KeyName(WPARAM vk) {
     case VK_ESCAPE: return "Escape";
     case VK_RETURN: return "Enter";
     case VK_SPACE: return " ";
+    // Keep the lock key identifiable in diagnostics while leaving it
+    // unconsumed so Windows can toggle Caps Lock for the focused application.
+    case VK_CAPITAL: return "CapsLock";
     case VK_OEM_MINUS: return "-";
     case VK_OEM_PLUS: return "=";
     case VK_SHIFT:
