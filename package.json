@@ -7,7 +7,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "vitest run",
+    "test": "vitest run --dir test",
     "test:watch": "vitest",
     "dev": "tsx src/index.ts",
     "host": "powershell -NoProfile -ExecutionPolicy Bypass -File native\\install-host.ps1",
