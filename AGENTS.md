@@ -24,7 +24,12 @@ Follow strict TypeScript settings: ES modules, two-space indentation, semicolons
 
 ## Architecture and Responsibility Boundaries
 
-**Single source of truth:** Node.js/TypeScript owns all IME business state and decisions. C++ is the Windows TSF/COM adapter; it must not implement a second pinyin buffer, candidate-selection policy, or parallel set of editing rules. Avoid duplicating behavior across languages.
+**Core project rules — three layers with separate responsibilities:**
+
+- **C++ is the Windows safety and integration layer.** It provides the OS-facing safeguards: TSF/COM lifecycle and object-lifetime safety, key-event consumption boundaries, context/focus handling, safe text insertion, IPC boundary checks, and explicit failure logging/recovery. C++ must enforce platform and process safety, but must not become a second owner of pinyin composition, candidate ranking, or application behavior.
+- **Go is an independent native implementation of the C++ TSF/COM path, not merely a host/IPC bridge.** The Go implementation must provide its own COM objects and implement the corresponding Windows TSF integration and lifecycle rather than relying on the C++ component to perform TSF operations. Reproduce the C++ path's externally observable integration behavior, including COM activation/lifetime, TSF callbacks and key-sink lifecycle, focus/context handling, edit-session and text-application behavior, IPC framing/correlation, error handling, logging, and recovery, as applicable to the implementation. Keep the TypeScript-facing protocol compatible so the Go and C++ native paths can serve as alternative implementations. Do not use Go as a second implementation of IME business rules. Document and test implementation parity explicitly; an architectural goal or passing Go unit tests alone does not establish full TSF/COM parity.
+- **TypeScript owns application/IME runtime logic.** It is the authority for logical composition state, key-to-state transitions, candidate generation/ranking, selection, commit/cancel semantics, and protocol-level IME decisions. C++ and Go forward events and apply authoritative responses; they must not independently reinterpret or duplicate these decisions.
+- **Keep contracts explicit across all three layers.** TypeScript defines what the IME should do; C++ and Go are alternative native implementations that independently provide the Windows safety and TSF/COM execution guarantees. Any cross-layer behavior change must update relevant protocol contracts and tests, and must not create divergent business logic.
 
 ### TypeScript responsibilities (`src/`)
 
@@ -32,12 +37,16 @@ Follow strict TypeScript settings: ES modules, two-space indentation, semicolons
 - `src/ime/reducer.ts`: implement deterministic key-to-state transitions and the `consume` decision. Backspace/Delete, Escape, navigation, candidate selection, and commit semantics belong here. Do not mutate IME business state in C++.
 - `src/ime/engine.ts`: coordinate reduction, candidate generation, and protocol responses.
 - `src/ime/candidates.ts`: generate and rank candidates from logical composition; keep dictionary and conversion policy out of native code.
+  - Candidate matching order matters: prefer exact dictionary-code matches first. For a one-letter query, prefer single-Han-character candidates; if the exact code has none, search codes beginning with that letter for single-character candidates before falling back to multi-character entries.
+  - For a multi-letter incomplete query, check real full-pinyin dictionary codes that start with the entire query before trying arbitrary composition splits. This lets inputs such as `xiangm` find `xiangmu` → `项目` instead of composing unrelated syllables.
+  - Dictionary-generated initials aliases must be marked with `isInitials`. They may support abbreviated input, but must not be treated as full syllables inside a longer composition; filter them out of composition splitting and full-pinyin-prefix matching to avoid noise such as `lianx` → `里啊那些`.
+  - Keep these rules covered by regression tests for one-letter input (`x`), incomplete pinyin (`xiangm`), and alias-splitting regressions (`lianx`). When debugging candidate ranking, set `IME_CANDIDATE_TRACE=1` to log matching mode, prefix matches, and composition split/weight details.
 - `src/pipe/` and `src/protocol/`: own JSONL message handling, validation, and protocol types. Keep requests/responses explicit and compatible with the native bridge.
 - Maintain state per TSF session. A key event must update only the session named in its message.
 
 ### Native responsibilities (`native/`)
 
-- Own Windows integration: TSF activation/deactivation, COM interfaces, key-event sink registration, context/edit-session lifecycle, focus/context handling, and safe insertion/commit of text through TSF APIs.
+- Both native paths must implement Windows integration independently: TSF activation/deactivation, their own COM interfaces/objects, key-event sink registration, context/edit-session lifecycle, focus/context handling, and safe insertion/commit of text through TSF APIs. The Go path must not depend on the C++ COM server to perform these operations.
 - Translate native virtual keys and modifier state into protocol messages, and relay the TypeScript response. Do not independently edit the pinyin string or decide which candidate should be selected.
 - Implement TSF's test-key phase (`OnTestKeyDown`) as a **side-effect-free consumption query**. It may ask TypeScript `testKeyDown` whether a key would be consumed, but must not mutate composition, commit text, or apply an edit during this phase.
 - Implement the actual key-down phase (`OnKeyDown`) by sending `keyDown` and applying the returned response only when appropriate. The logical state transition happens once, in TypeScript, in this phase—not in both phases.
