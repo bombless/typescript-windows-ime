@@ -52,6 +52,9 @@ Follow strict TypeScript settings: ES modules, two-space indentation, semicolons
 - Implement the actual key-down phase (`OnKeyDown`) by sending `keyDown` and applying the returned response only when appropriate. The logical state transition happens once, in TypeScript, in this phase—not in both phases.
 - `ApplyResponse` and edit-session code are presentation/OS integration, not a second IME engine. They apply the authoritative composition/commit and candidate data returned by TypeScript, manage native TSF object lifetimes, and report failures. Do not silently invent a different composition to recover from an error; log it and use an explicit reset/resynchronization path.
 - Keep native candidate-window rendering, caret anchoring, DPI handling, and resource management in C++ where they require Windows APIs. Candidate contents and selected index must come from TypeScript.
+- **Native GDI rendering rules:**
+  - In off-screen double-buffering (`CreateCompatibleDC` + `CreateCompatibleBitmap`), do **not** unbind the drawing bitmap before copying. Always execute `BitBlt(target, ..., memory, ..., SRCCOPY)` **before** restoring `SelectObject(memory, oldBitmap)`. Restoring `oldBitmap` first unbinds the content bitmap and leaves `memory` holding Windows' default 1×1 monochrome stub, causing `BitBlt` to output blank/empty content to the desktop.
+  - Implement `WM_PRINTCLIENT` alongside `WM_PAINT` in candidate window procedures so `PrintWindow` and diagnostics can reliably sample the rendered surface without screen flicker or timing races.
 - Native key-name translation may map `VK_BACK` to `Backspace` and `VK_DELETE` to `Delete`; it must not implement their editing semantics.
 
 ### Key Consumption and Editing Contract
