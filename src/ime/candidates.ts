@@ -1,23 +1,20 @@
 import type { Candidate } from "../protocol/messages.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import OpenCC from "opencc-js";
-
-interface Entry { text: string; code: string; weight: number; priority: number; }
-interface PartialCandidate { text: string; weight: number; }
+interface Entry { text: string; code: string; weight: number; priority: number; isInitials?: boolean; }
+interface PartialCandidate { text: string; weight: number; trace?: string[]; }
 const CUSTOM_DICTIONARY_PATH = fileURLToPath(new URL("../../data/custom.dict.yaml", import.meta.url));
 const DICTIONARY_PATH = fileURLToPath(new URL("../../data/pinyin_simp.dict.yaml", import.meta.url));
 const MICROSOFT_DICTIONARY_PATH = fileURLToPath(new URL("../../data/microsoft_pinyin.dict.yaml", import.meta.url));
 // Keep enough results available for candidate paging; the UI displays 9 per page.
 const MAX_CANDIDATES = 90;
-const toSimplified = OpenCC.Converter({ from: "twp", to: "cn" });
 
 function normalizeCode(value: string): string {
   return value.toLowerCase().replace(/[\s'’`-]+/g, "");
 }
 
 function toUserText(value: string): string {
-  return String(toSimplified(value)).replaceAll("妳", "你");
+  return value.replaceAll("妳", "你");
 }
 
 function loadDictionary(path?: string): Map<string, Entry[]> {
@@ -49,7 +46,7 @@ function loadDictionary(path?: string): Map<string, Entry[]> {
       const syllables = rawCode.toLowerCase().split(/[\s'’`-]+/).filter(Boolean);
       if (syllables.length > 1 && syllables.every((syllable) => /^[a-z]+$/.test(syllable))) {
         const initials = syllables.map((syllable) => syllable[0]).join("");
-        if (initials !== code) addEntry(initials, { ...entry, code: initials });
+        if (initials !== code) addEntry(initials, { ...entry, code: initials, isInitials: true });
       }
     }
   };
@@ -88,15 +85,66 @@ function queryDictionary(composition: string, sourceDictionary: Map<string, Entr
   const query = normalizeCode(composition);
   if (!query) return [];
   const exact = sourceDictionary.get(query) ?? [];
-  if (exact.length > 0) {
+  // For a single-letter composition, prefer entries that are a single Han
+  // character. Only broaden to multi-character words when no single-character
+  // result exists for this code. This prevents initial-letter aliases and
+  // short codes from crowding out the basic single-character candidates.
+  if (query.length === 1) {
+    const toCandidate = (entry: Entry, index: number): Candidate => ({
+      text: toUserText(entry.text), index, annotation: entry.code,
+    });
+    const exactSingleCharacters = exact.filter((entry) => [...toUserText(entry.text)].length === 1);
+    const singleCharacterEntries = exactSingleCharacters.length > 0
+      ? exactSingleCharacters
+      : [...sourceDictionary.entries()]
+        .filter(([code]) => code.startsWith(query))
+        .flatMap(([, entries]) => entries.filter((entry) => [...toUserText(entry.text)].length === 1));
+    const seenSingleCharacters = new Set<string>();
+    const singleCharacterCandidates = singleCharacterEntries
+      .map(toCandidate)
+      .filter((candidate) => !seenSingleCharacters.has(candidate.text) && (seenSingleCharacters.add(candidate.text), true))
+      .slice(0, MAX_CANDIDATES)
+      .map((candidate, index) => ({ ...candidate, index }));
+    if (singleCharacterCandidates.length > 0) return singleCharacterCandidates;
+    if (exact.length > 0) {
+      return exact.map(toCandidate)
+        .filter((entry, index, list) => list.findIndex((candidate) => candidate.text === entry.text) === index)
+        .slice(0, MAX_CANDIDATES)
+        .map((entry, index) => ({ ...entry, index }));
+    }
+  } else if (exact.length > 0) {
     return exact.map((entry) => ({ ...entry, text: toUserText(entry.text) }))
       .filter((entry, index, list) => list.findIndex((candidate) => candidate.text === entry.text) === index)
       .slice(0, MAX_CANDIDATES)
       .map((entry, index) => ({ text: entry.text, index, annotation: entry.code }));
   }
 
+  const traceEnabled = process.env.IME_CANDIDATE_TRACE === "1";
+  // A query can end in the middle of a syllable (e.g. "xiangm" while typing
+  // "xiangmu"). Prefer real full-pinyin dictionary codes that start with the
+  // whole query before attempting arbitrary character-by-character splits.
+  // Otherwise a valid prefix like "xiangm" can be segmented as "xiang" + "m".
+  const prefixMatches = [...sourceDictionary.entries()]
+    .filter(([code]) => code.startsWith(query))
+    .flatMap(([, entries]) => entries.filter((entry) => !entry.isInitials))
+    .sort((a, b) => a.priority - b.priority || b.weight - a.weight);
+  if (prefixMatches.length > 0) {
+    if (traceEnabled) {
+      console.log(`[ime-candidates] query=${query} resultMode=full-pinyin-prefix matches=${prefixMatches.length}`);
+      for (const entry of prefixMatches.slice(0, 12)) {
+        const displayText = toUserText(entry.text);
+        console.log(`[ime-candidates] prefix raw=${JSON.stringify(entry.text)} display=${JSON.stringify(displayText)} fullCode=${entry.code} weight=${entry.weight}${displayText !== entry.text ? " converted=1" : ""}`);
+      }
+    }
+    const seenPrefix = new Set<string>();
+    return prefixMatches
+      .map((entry) => ({ text: toUserText(entry.text), index: 0, annotation: entry.code }))
+      .filter((candidate) => !seenPrefix.has(candidate.text) && (seenPrefix.add(candidate.text), true))
+      .slice(0, MAX_CANDIDATES)
+      .map((candidate, index) => ({ ...candidate, index }));
+  }
   const combinations: PartialCandidate[][] = Array.from({ length: query.length + 1 }, () => []);
-  combinations[0] = [{ text: "", weight: 0 }];
+  combinations[0] = [{ text: "", weight: 0, ...(traceEnabled ? { trace: [] } : {}) }];
   const dictionaryEntries = sourceDictionary;
   for (let offset = 0; offset < query.length; offset++) {
     const current = combinations[offset];
@@ -104,12 +152,20 @@ function queryDictionary(composition: string, sourceDictionary: Map<string, Entr
     for (const [code, entries] of dictionaryEntries) {
       if (!query.startsWith(code, offset)) continue;
       const next = offset + code.length;
-      const topEntries = entries.slice(0, 4);
+      // Initials aliases are useful for abbreviated input, but must not be
+      // treated as full syllables inside a longer pinyin composition (e.g.
+      // "lianx" must not become "li" + "a" + "nx" -> "里啊那些").
+      const topEntries = entries.filter((entry) => !entry.isInitials).slice(0, 4);
+      if (topEntries.length === 0) continue;
       const target = combinations[next];
       if (!target) continue;
       for (const prefix of current) {
         for (const entry of topEntries) {
-          target.push({ text: prefix.text + entry.text, weight: prefix.weight + entry.weight - 100 });
+          target.push({
+            text: prefix.text + entry.text,
+            weight: prefix.weight + entry.weight - 100,
+            ...(traceEnabled ? { trace: [...(prefix.trace ?? []), `${code} -> ${entry.text} (dict code: ${entry.code}, weight: ${entry.weight})`] } : {}),
+          });
         }
       }
       target.sort((a, b) => b.weight - a.weight);
@@ -117,10 +173,22 @@ function queryDictionary(composition: string, sourceDictionary: Map<string, Entr
     }
   }
   const composed = combinations[query.length] ?? [];
+  if (traceEnabled) {
+    console.log(`[ime-candidates] query=${query} exact=${(sourceDictionary.get(query) ?? []).length} composed=${composed.length}`);
+    for (const candidate of composed.slice(0, 12)) {
+      console.log(`[ime-candidates] candidate=${JSON.stringify(candidate.text)} weight=${candidate.weight} via=${(candidate.trace ?? []).join(" | ")}`);
+    }
+  }
   const results = composed.length > 0 ? composed : [...sourceDictionary.entries()]
     .filter(([code]) => code.startsWith(query))
     .sort((a, b) => (b[1][0]?.weight ?? 0) - (a[1][0]?.weight ?? 0))
     .flatMap(([, list]) => list);
+  if (traceEnabled) {
+    console.log(`[ime-candidates] resultMode=${composed.length > 0 ? "composition" : "prefix-fallback"} rawResults=${results.length}`);
+    for (const candidate of results.slice(0, 12)) {
+      console.log(`[ime-candidates] result=${JSON.stringify(candidate.text)} code=${"code" in candidate ? candidate.code : "composed"} weight=${candidate.weight}`);
+    }
+  }
   const seen = new Set<string>();
   return results.map((entry) => {
     const text = toUserText(entry.text);
@@ -141,8 +209,14 @@ export function getCandidates(composition: string): Candidate[] {
     .slice(0, MAX_CANDIDATES);
   const primary = queryDictionary(composition, getDictionary());
   const combined = [...custom, ...primary];
+  // Apply the one-letter rule across dictionary sources too: a custom multi-
+  // character entry must not outrank available single-character candidates.
+  const preferred = query.length === 1
+    ? combined.filter((candidate) => [...candidate.text].length === 1)
+    : combined;
+  const candidates = preferred.length > 0 ? preferred : combined;
   const seen = new Set<string>();
-  const deduplicated = combined.filter((candidate) => {
+  const deduplicated = candidates.filter((candidate) => {
     if (seen.has(candidate.text)) return false;
     seen.add(candidate.text);
     return true;

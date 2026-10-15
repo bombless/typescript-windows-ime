@@ -149,6 +149,13 @@ describe("initial key behavior", () => {
     expect(letter.response.consume).toBe(false);
     expect(letter.state).toEqual({ composition: "", selectedCandidate: 0, mode: "english" });
 
+    // Caps Lock must be left to Windows in English mode; the target app then
+    // receives normal keyboard input and applies the active lock state itself.
+    const englishState = { composition: "", selectedCandidate: 0, mode: "english" as const };
+    const capsLock = engine.processKey({ id: 2021, session: 1, type: "keyDown", vk: 0x14, scanCode: 0x3a, key: "CapsLock", modifiers: 0 }, englishState);
+    expect(capsLock.response.consume).toBe(false);
+    expect(capsLock.state).toEqual(englishState);
+
     const toChinese = toggle(toEnglish.state, 203);
     expect(toChinese.response.consume).toBe(true);
     expect(toChinese.response.mode).toBe("chinese");
@@ -274,6 +281,26 @@ describe("initial key behavior", () => {
     expect(committed.response.commit).toBe(selected);
     expect(committed.state).toEqual({ composition: "", selectedCandidate: 0 });
   });
+  it("prefers single-character candidates for one-letter input before multi-character fallbacks", () => {
+    const candidates = getCandidates("x");
+    expect(candidates.length).toBeGreaterThan(0);
+    expect(candidates.every((candidate) => [...candidate.text].length === 1)).toBe(true);
+  });
+
+  it("does not compose full pinyin from internal initials aliases", () => {
+    const candidates = getCandidates("lianx").map((candidate) => candidate.text);
+    expect(candidates).toContain("联系");
+    expect(candidates).not.toContain("里啊那些");
+    expect(candidates).not.toContain("里啊女性");
+  });
+
+  it("prioritizes full-pinyin dictionary prefixes for incomplete final syllables", () => {
+    const candidates = getCandidates("xiangm").map((candidate) => candidate.text);
+    expect(candidates[0]).toBe("项目");
+    expect(candidates).not.toContain("想呒");
+    expect(candidates).not.toContain("下嗯呒");
+  });
+
   it("prioritizes custom dictionary entries and de-duplicates Xiaoheilo candidates", () => {
     const candidates = getCandidates("maohao");
     const texts = candidates.map((candidate) => candidate.text);
