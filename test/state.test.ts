@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { initialImeState } from "../src/ime/state.js";
 import { reduceKey } from "../src/ime/reducer.js";
-import { getCandidates } from "../src/ime/candidates.js";
+import { getCandidates, getKnownWordEntries } from "../src/ime/candidates.js";
 
 describe("initial key behavior", () => {
   it.each([
@@ -281,6 +281,21 @@ describe("initial key behavior", () => {
     expect(committed.response.commit).toBe(selected);
     expect(committed.state).toEqual({ composition: "", selectedCandidate: 0 });
   });
+  it("indexes known words by display text and preserves multiple dictionary entries", () => {
+    expect(getKnownWordEntries("项目").length).toBeGreaterThan(0);
+    expect(getKnownWordEntries("的").length).toBeGreaterThan(1);
+    expect(getKnownWordEntries("这不是词典里的词")).toEqual([]);
+  });
+
+  it("keeps continuation fallback deterministic, deduplicated, and bounded", () => {
+    const first = getCandidates("houxuank");
+    const second = getCandidates("houxuank");
+    expect(first.length).toBeGreaterThan(0);
+    expect(first.length).toBeLessThanOrEqual(90);
+    expect(new Set(first.map((candidate) => candidate.text)).size).toBe(first.length);
+    expect(first.map((candidate) => candidate.text)).toEqual(second.map((candidate) => candidate.text));
+  });
+
   it("prefers single-character candidates for one-letter input before multi-character fallbacks", () => {
     const candidates = getCandidates("x");
     expect(candidates.length).toBeGreaterThan(0);

@@ -24,6 +24,29 @@ HRESULT GetRangeExtent(ITfRange* range, LONG* start, LONG* length) {
     rangeAcp->Release();
     return extentHr;
 }
+
+void LogTsfViewGeometry(const char* tag, ITfContextView* view) {
+    if (!view) return;
+    HWND hwnd = nullptr;
+    const HRESULT wndHr = view->GetWnd(&hwnd);
+    RECT wr{}; RECT cr{}; RECT cs{};
+    const BOOL wok = hwnd && GetWindowRect(hwnd, &wr);
+    BOOL cok = hwnd && GetClientRect(hwnd, &cr);
+    if (cok) {
+        POINT a{ cr.left, cr.top }, b{ cr.right, cr.bottom };
+        if (ClientToScreen(hwnd, &a) && ClientToScreen(hwnd, &b)) cs = RECT{ a.x, a.y, b.x, b.y };
+        else cok = FALSE;
+    }
+    wchar_t cls[128]{};
+    if (hwnd) GetClassNameW(hwnd, cls, ARRAYSIZE(cls));
+    DWORD pid = 0;
+    const DWORD tid = hwnd ? GetWindowThreadProcessId(hwnd, &pid) : 0;
+    NativeLog::Write("TSF view-geometry tag=%s getWndHr=0x%08lX hwnd=%p class=%ls pid=%lu tid=%lu windowOk=%d window=%ld,%ld,%ld,%ld clientScreenOk=%d clientScreen=%ld,%ld,%ld,%ld visible=%d iconic=%d",
+        tag, static_cast<unsigned long>(wndHr), static_cast<void*>(hwnd), cls, pid, tid,
+        wok ? 1 : 0, wr.left, wr.top, wr.right, wr.bottom, cok ? 1 : 0,
+        cs.left, cs.top, cs.right, cs.bottom, hwnd && IsWindowVisible(hwnd) ? 1 : 0,
+        hwnd && IsIconic(hwnd) ? 1 : 0);
+}
 class TextService;
 
 // TSF language-bar item: Node's mode response drives the visible CN/EN label.
@@ -289,6 +312,7 @@ public:
             return hr_;
         }
 
+        LogTsfViewGeometry("CaretProbe", view);
         RECT rect{};
         BOOL clipped = FALSE;
         ITfRange* end = nullptr;
@@ -562,6 +586,7 @@ private:
         if (FAILED(context_->GetActiveView(&view)) || !view) {
             return;
         }
+        LogTsfViewGeometry("CompositionSink", view);
         // The insertion point anchors the window. Applications that have not
         // laid out the fresh composition yet fail on the collapsed range, so
         // the whole composition rectangle is used as the fallback anchor.

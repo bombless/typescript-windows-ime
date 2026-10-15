@@ -103,12 +103,12 @@ void Paint(HDC target) {
         width, height, g_candidates.size(), g_rowHeight, g_numberWidth, g_font, g_dpi, stage);
     if (width <= 0 || height <= 0) return;
 
-    // TEMPORARY VISIBILITY TEST: enabled by default until desktop presentation
-    // is confirmed. Set TSWIME_RED_SCREEN_TEST=0 to restore normal list painting.
+    // Keep the red visibility test opt-in; normal host use must paint the
+    // numbered candidate list rather than covering it with a diagnostic screen.
     wchar_t redTestValue[8]{};
     const DWORD redTestLength = GetEnvironmentVariableW(L"TSWIME_RED_SCREEN_TEST",
         redTestValue, ARRAYSIZE(redTestValue));
-    const bool redTest = redTestLength == 0 || _wtoi(redTestValue) != 0;
+    const bool redTest = redTestLength > 0 && _wtoi(redTestValue) != 0;
     if (redTest) {
         const HBRUSH diagnosticRed = CreateSolidBrush(RGB(255, 0, 0));
         FillRect(target, &client, diagnosticRed);
@@ -234,9 +234,9 @@ void Paint(HDC target) {
         DeleteObject(border);
     }
 
+    BitBlt(target, 0, 0, width, height, memory, 0, 0, SRCCOPY);
     if (!skipFont) SelectObject(memory, oldFont);
     SelectObject(memory, oldBitmap);
-    BitBlt(target, 0, 0, width, height, memory, 0, 0, SRCCOPY);
     DeleteObject(bitmap);
     DeleteDC(memory);
 }
@@ -246,8 +246,17 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_PAINT: {
         PAINTSTRUCT paint{};
         HDC dc = BeginPaint(window, &paint);
+        NativeLog::Write("CandidateWindow WM_PAINT hwnd=%p dc=%p update=%ld,%ld,%ld,%ld clientValid=%d",
+            static_cast<void*>(window), static_cast<void*>(dc), paint.rcPaint.left,
+            paint.rcPaint.top, paint.rcPaint.right, paint.rcPaint.bottom,
+            IsWindow(window) ? 1 : 0);
         Paint(dc);
         EndPaint(window, &paint);
+        NativeLog::Write("CandidateWindow WM_PAINT complete hwnd=%p", static_cast<void*>(window));
+        return 0;
+    }
+    case WM_PRINTCLIENT: {
+        Paint(reinterpret_cast<HDC>(wParam));
         return 0;
     }
     case WM_ERASEBKGND:
@@ -273,8 +282,15 @@ bool EnsureClass() {
     windowClass.hInstance = ModuleHandle();
     windowClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(kArrowCursorResource));
     windowClass.lpszClassName = kWindowClass;
-    if (RegisterClassExW(&windowClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        NativeLog::Win32("CandidateWindow RegisterClassEx");
+    SetLastError(ERROR_SUCCESS);
+    const ATOM classAtom = RegisterClassExW(&windowClass);
+    const DWORD classError = classAtom ? ERROR_SUCCESS : GetLastError();
+    NativeLog::Write("CandidateWindow RegisterClassEx result atom=%u error=%lu alreadyExists=%d module=%p thread=%lu",
+        static_cast<unsigned>(classAtom), classError,
+        classError == ERROR_CLASS_ALREADY_EXISTS ? 1 : 0,
+        static_cast<void*>(windowClass.hInstance), GetCurrentThreadId());
+    if (classAtom == 0 && classError != ERROR_CLASS_ALREADY_EXISTS) {
+        NativeLog::Win32("CandidateWindow RegisterClassEx", classError);
         return false;
     }
     g_classRegistered = true;
@@ -290,14 +306,26 @@ HWND EnsureWindow() {
     // application's window, so the list would end up underneath that
     // application. It is also created hidden and shown by Show so that the first
     // frame is painted after the size is known.
+    NativeLog::Write("CandidateWindow CreateWindowEx begin class=%ls exStyle=0x%08lx style=0x%08lx module=%p owner=%p thread=%lu",
+        kWindowClass, static_cast<unsigned long>(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST),
+        static_cast<unsigned long>(WS_POPUP), static_cast<void*>(ModuleHandle()),
+        static_cast<void*>(owner), GetCurrentThreadId());
+    SetLastError(ERROR_SUCCESS);
     g_window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
         kWindowClass, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, ModuleHandle(), nullptr);
+    const DWORD createError = g_window ? ERROR_SUCCESS : GetLastError();
+    NativeLog::Write("CandidateWindow CreateWindowEx result hwnd=%p error=%lu isWindow=%d visible=%d thread=%lu",
+        static_cast<void*>(g_window), createError,
+        g_window && IsWindow(g_window) ? 1 : 0,
+        g_window && IsWindowVisible(g_window) ? 1 : 0, GetCurrentThreadId());
     if (!g_window) {
-        NativeLog::Win32("CandidateWindow CreateWindowEx");
+        NativeLog::Win32("CandidateWindow CreateWindowEx", createError);
         return nullptr;
     }
-    NativeLog::Write("CandidateWindow created owner=%p foreground=%p",
-        static_cast<void*>(owner), static_cast<void*>(GetForegroundWindow()));
+    NativeLog::Write("CandidateWindow created hwnd=%p owner=%p foreground=%p style=0x%08lx exStyle=0x%08lx",
+        static_cast<void*>(g_window), static_cast<void*>(owner), static_cast<void*>(GetForegroundWindow()),
+        static_cast<unsigned long>(GetWindowLongPtrW(g_window, GWL_STYLE)),
+        static_cast<unsigned long>(GetWindowLongPtrW(g_window, GWL_EXSTYLE)));
     return g_window;
 }
 
@@ -320,32 +348,66 @@ RECT ApplicationRect() {
 
 void Place(HWND window, RECT caret) {
     if (!window || !IsWindow(window)) return;
-    if (IsCaretRectEmpty(caret)) caret = ApplicationRect();
+    if (IsCaretRectEmpty(caret)) {
+        // Some TSF clients do not provide a caret rectangle. The foreground
+        // window's client origin is not a reliable fallback: it can be a
+        // hidden/off-screen surface (observed at y=-1080), which makes the
+        // candidate list appear to vanish. Prefer the actual pointer location.
+        POINT cursor{};
+        if (GetCursorPos(&cursor)) {
+            caret = RECT{ cursor.x, cursor.y, cursor.x + 1, cursor.y + 1 };
+            NativeLog::Write("CandidateWindow cursor fallback %ld,%ld", cursor.x, cursor.y);
+        } else {
+            caret = ApplicationRect();
+        }
+    }
     RECT workArea{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
     const HMONITOR monitor = caret.right > caret.left
         ? MonitorFromRect(&caret, MONITOR_DEFAULTTONEAREST)
         : MonitorFromPoint(POINT{ caret.left, caret.top }, MONITOR_DEFAULTTONEAREST);
     MONITORINFO monitorInfo{};
     monitorInfo.cbSize = sizeof(monitorInfo);
-    if (monitor && GetMonitorInfoW(monitor, &monitorInfo)) workArea = monitorInfo.rcMonitor;
+    if (monitor && GetMonitorInfoW(monitor, &monitorInfo)) workArea = monitorInfo.rcWork;
 
     const int x = ClampToWorkArea(caret.left, workArea.left, workArea.right - g_width);
-    const int below = workArea.bottom - caret.bottom;
-    const int above = caret.top - workArea.top;
-    const int y = (g_height <= below || below >= above)
-        ? ClampToWorkArea(caret.bottom, workArea.top, workArea.bottom - g_height)
-        : ClampToWorkArea(caret.top - g_height, workArea.top, workArea.bottom - g_height);
+    // Prefer the full candidate list. If there is not enough room below the
+    // caret (common when we fall back to the mouse position), place it above
+    // instead; only shrink the list when neither side has enough room.
+    const int desiredHeight = MinInt(g_height, MaxInt(1, workArea.bottom - workArea.top));
+    const int belowY = ClampToWorkArea(caret.bottom, workArea.top, workArea.bottom - 1);
+    const int belowSpace = MaxInt(1, workArea.bottom - belowY);
+    const int aboveSpace = MaxInt(0, caret.top - workArea.top);
+    int y = belowY;
+    int height = desiredHeight;
+    if (belowSpace >= desiredHeight) {
+        y = belowY;
+    } else if (aboveSpace >= desiredHeight) {
+        y = caret.top - desiredHeight;
+    } else if (aboveSpace > belowSpace) {
+        height = MaxInt(1, MinInt(desiredHeight, aboveSpace));
+        y = caret.top - height;
+    } else {
+        height = MaxInt(1, MinInt(desiredHeight, belowSpace));
+        y = belowY;
+    }
     const int width = g_width;
-    const int height = g_height;
     if (width <= 0 || height <= 0) return;
 
-    SetWindowPos(window, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRect(window, nullptr, FALSE);
+    SetLastError(ERROR_SUCCESS);
+    const BOOL positionResult = SetWindowPos(window, HWND_TOPMOST, x, y, width, height,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    const DWORD positionError = positionResult ? ERROR_SUCCESS : GetLastError();
+    SetLastError(ERROR_SUCCESS);
+    const BOOL invalidateResult = InvalidateRect(window, nullptr, FALSE);
+    const DWORD invalidateError = invalidateResult ? ERROR_SUCCESS : GetLastError();
     RECT placed{};
     GetWindowRect(window, &placed);
-    NativeLog::Write("CandidateWindow placed caret=%ld,%ld,%ld,%ld at=%d,%d size=%dx%d rect=%ld,%ld,%ld,%ld visible=%d",
-        caret.left, caret.top, caret.right, caret.bottom, x, y, g_width, g_height,
-        placed.left, placed.top, placed.right, placed.bottom, IsWindowVisible(window) ? 1 : 0);
+    NativeLog::Write("CandidateWindow placed hwnd=%p setPos=%d setPosError=%lu invalidate=%d invalidateError=%lu caret=%ld,%ld,%ld,%ld at=%d,%d size=%dx%d desiredHeight=%d rect=%ld,%ld,%ld,%ld visible=%d isWindow=%d thread=%lu",
+        static_cast<void*>(window), positionResult ? 1 : 0, positionError,
+        invalidateResult ? 1 : 0, invalidateError,
+        caret.left, caret.top, caret.right, caret.bottom, x, y, g_width, height, g_height,
+        placed.left, placed.top, placed.right, placed.bottom, IsWindowVisible(window) ? 1 : 0,
+        IsWindow(window) ? 1 : 0, GetWindowThreadProcessId(window, nullptr));
 }
 
 bool Measure(int& width, int& height) {
@@ -362,7 +424,19 @@ bool Measure(int& width, int& height) {
     }
     g_numberWidth = Scale(22);
     const int textLeft = Scale(6) + g_numberWidth + Scale(6);
-    width = MinInt(textLeft + widest + Scale(8), Scale(360));
+    // Size to the measured text instead of imposing the old 360-DIP cap.
+    // Bound the popup to the active monitor's work area to avoid off-screen UI.
+    int availableWidth = GetSystemMetrics(SM_CXSCREEN) - Scale(16);
+    HWND foreground = GetForegroundWindow();
+    HMONITOR monitor = foreground
+        ? MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) : nullptr;
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (monitor && GetMonitorInfoW(monitor, &monitorInfo)) {
+        availableWidth = monitorInfo.rcWork.right - monitorInfo.rcWork.left - Scale(16);
+    }
+    const int desiredWidth = textLeft + widest + Scale(14);
+    width = MinInt(desiredWidth, MaxInt(Scale(160), availableWidth));
     g_rowHeight = metrics.tmHeight + Scale(6);
     height = g_rowHeight * static_cast<int>(g_candidates.size()) + Scale(2);
     SelectObject(dc, oldFont);
@@ -431,14 +505,26 @@ bool ShowOnUiThread(const std::vector<std::wstring>& candidates, UINT selection,
     // still needed: a window that has never been shown has no DWM redirection
     // surface, and without one nothing this window paints is ever presented,
     // even though IsWindowVisible and the z-order both look correct.
-    ShowWindow(window, SW_SHOWNOACTIVATE);
-    SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
+    const BOOL wasVisible = ShowWindow(window, SW_SHOWNOACTIVATE);
+    SetLastError(ERROR_SUCCESS);
+    const BOOL finalPositionResult = SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    RedrawWindow(window, nullptr, nullptr,
+    const DWORD finalPositionError = finalPositionResult ? ERROR_SUCCESS : GetLastError();
+    SetLastError(ERROR_SUCCESS);
+    const BOOL redrawResult = RedrawWindow(window, nullptr, nullptr,
         RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_FRAME | RDW_ALLCHILDREN);
+    const DWORD redrawError = redrawResult ? ERROR_SUCCESS : GetLastError();
 
-    NativeLog::Write("CandidateWindow Show count=%u selection=%u size=%dx%d dpi=%u",
-        static_cast<unsigned>(g_candidates.size()), g_selection, g_width, g_height, g_dpi);
+    RECT finalRect{};
+    const BOOL gotRect = GetWindowRect(window, &finalRect);
+    NativeLog::Write("CandidateWindow Show hwnd=%p wasVisible=%d finalSetPos=%d finalSetPosError=%lu redraw=%d redrawError=%lu rectOk=%d rect=%ld,%ld,%ld,%ld client=%dx%d visible=%d enabled=%d count=%u selection=%u size=%dx%d dpi=%u thread=%lu",
+        static_cast<void*>(window), wasVisible ? 1 : 0, finalPositionResult ? 1 : 0,
+        finalPositionError, redrawResult ? 1 : 0, redrawError, gotRect ? 1 : 0,
+        finalRect.left, finalRect.top, finalRect.right, finalRect.bottom,
+        finalRect.right - finalRect.left, finalRect.bottom - finalRect.top,
+        IsWindowVisible(window) ? 1 : 0, IsWindowEnabled(window) ? 1 : 0,
+        static_cast<unsigned>(g_candidates.size()), g_selection, g_width, g_height, g_dpi,
+        GetWindowThreadProcessId(window, nullptr));
     return true;
 }
 

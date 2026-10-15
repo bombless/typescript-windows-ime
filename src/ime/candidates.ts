@@ -3,6 +3,18 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 interface Entry { text: string; code: string; weight: number; priority: number; isInitials?: boolean; }
 interface PartialCandidate { text: string; weight: number; trace?: string[]; }
+interface KnownWordEntry { weight: number; priority: number; sourcePriority: number; code: string; }
+interface ContinuationCandidate {
+  text: string;
+  knownWord: boolean;
+  knownWordWeight: number;
+  knownWordPriority: number;
+  sourcePriority: number;
+  prefixRank: number;
+  suffixRank: number;
+  synthetic: boolean;
+  sequence: number;
+}
 const CUSTOM_DICTIONARY_PATH = fileURLToPath(new URL("../../data/custom.dict.yaml", import.meta.url));
 const DICTIONARY_PATH = fileURLToPath(new URL("../../data/pinyin_simp.dict.yaml", import.meta.url));
 const MICROSOFT_DICTIONARY_PATH = fileURLToPath(new URL("../../data/microsoft_pinyin.dict.yaml", import.meta.url));
@@ -79,6 +91,40 @@ function getMicrosoftDictionary(): Map<string, Entry[]> {
     microsoftDictionary = new Map();
   }
   return microsoftDictionary;
+}
+
+// Build this once from all sources. Keep every matching entry because one
+// displayed word may have multiple codes or originate in multiple dictionaries.
+let wordIndex: Map<string, KnownWordEntry[]> | undefined;
+function getWordIndex(): Map<string, KnownWordEntry[]> {
+  if (wordIndex) return wordIndex;
+  const index = new Map<string, KnownWordEntry[]>();
+  const sources = [
+    { dictionary: getCustomDictionary(), sourcePriority: 0 },
+    { dictionary: getDictionary(), sourcePriority: 1 },
+    { dictionary: getMicrosoftDictionary(), sourcePriority: 2 },
+  ];
+  for (const { dictionary: source, sourcePriority } of sources) {
+    for (const entries of source.values()) {
+      for (const entry of entries) {
+        if (entry.isInitials) continue;
+        const text = toUserText(entry.text);
+        const matches = index.get(text) ?? [];
+        matches.push({ weight: entry.weight, priority: entry.priority, sourcePriority, code: entry.code });
+        index.set(text, matches);
+      }
+    }
+  }
+  for (const entries of index.values()) {
+    entries.sort((a, b) => a.sourcePriority - b.sourcePriority || a.priority - b.priority || b.weight - a.weight || a.code.localeCompare(b.code));
+  }
+  wordIndex = index;
+  return index;
+}
+
+// Kept module-local to the TypeScript IME layer; this does not alter the IPC Candidate contract.
+export function getKnownWordEntries(text: string): ReadonlyArray<KnownWordEntry> {
+  return getWordIndex().get(toUserText(text)) ?? [];
 }
 
 function queryDictionary(composition: string, sourceDictionary: Map<string, Entry[]>): Candidate[] {
@@ -248,26 +294,50 @@ export function getCandidates(composition: string): Candidate[] {
       .filter((candidate) => [...candidate.text].length === 1);
     if (suffixCandidates.length === 0) continue;
 
-    const seenCombined = new Set<string>();
-    const combinedCandidates: Candidate[] = [];
-    for (const left of prefixCandidates) {
-      for (const right of suffixCandidates) {
+    const knownWords = getWordIndex();
+    const suffixRanks = new Map(suffixCandidates.map((candidate, rank) => [candidate.text, rank]));
+    const combinedCandidates: ContinuationCandidate[] = [];
+    let sequence = 0;
+    // Rank the bounded cross-product before truncating, rather than letting
+    // loop order decide which candidates survive the result limit.
+    for (const [prefixRank, left] of prefixCandidates.slice(0, MAX_CANDIDATES).entries()) {
+      for (const right of suffixCandidates.slice(0, MAX_CANDIDATES)) {
         const text = left.text + right.text;
-        if (seenCombined.has(text)) continue;
-        seenCombined.add(text);
-        combinedCandidates.push({ text, index: combinedCandidates.length });
-        if (combinedCandidates.length >= MAX_CANDIDATES) break;
+        const matches = knownWords.get(text) ?? [];
+        const best = matches[0];
+        combinedCandidates.push({
+          text,
+          knownWord: matches.length > 0,
+          knownWordWeight: best?.weight ?? 0,
+          knownWordPriority: best?.priority ?? Number.MAX_SAFE_INTEGER,
+          sourcePriority: best?.sourcePriority ?? Number.MAX_SAFE_INTEGER,
+          prefixRank,
+          suffixRank: suffixRanks.get(right.text) ?? Number.MAX_SAFE_INTEGER,
+          synthetic: matches.length === 0,
+          sequence: sequence++,
+        });
       }
-      if (combinedCandidates.length >= MAX_CANDIDATES) break;
     }
-    if (combinedCandidates.length > 0) {
+    const unique = new Set<string>();
+    const ranked = combinedCandidates.sort((a, b) =>
+      Number(b.knownWord) - Number(a.knownWord)
+      || a.sourcePriority - b.sourcePriority
+      || a.knownWordPriority - b.knownWordPriority
+      || b.knownWordWeight - a.knownWordWeight
+      || a.prefixRank - b.prefixRank
+      || a.suffixRank - b.suffixRank
+      || Number(a.synthetic) - Number(b.synthetic)
+      || a.sequence - b.sequence,
+    ).filter((candidate) => !unique.has(candidate.text) && (unique.add(candidate.text), true))
+      .slice(0, MAX_CANDIDATES);
+    if (ranked.length > 0) {
       if (traceEnabled) {
-        console.log(`[ime-candidates] query=${query} resultMode=prefix-plus-single-char prefix=${prefix} prefixCount=${prefixCandidates.length} suffix=${suffix} suffixSingleChars=${suffixCandidates.length} combined=${combinedCandidates.length}`);
-        for (const candidate of combinedCandidates.slice(0, 12)) {
-          console.log(`[ime-candidates] continued=${JSON.stringify(candidate.text)}`);
+        console.log(`[ime-candidates] query=${query} resultMode=prefix-plus-single-char prefix=${prefix} prefixCount=${prefixCandidates.length} suffix=${suffix} suffixSingleChars=${suffixCandidates.length} combined=${ranked.length}`);
+        for (const candidate of ranked.slice(0, 12)) {
+          console.log(`[ime-candidates] continued=${JSON.stringify(candidate.text)} known=${candidate.knownWord} weight=${candidate.knownWordWeight} prefixRank=${candidate.prefixRank} suffixRank=${candidate.suffixRank}`);
         }
       }
-      return combinedCandidates.map((candidate, index) => ({ ...candidate, index }));
+      return ranked.map((candidate, index) => ({ text: candidate.text, index }));
     }
   }
   return [];

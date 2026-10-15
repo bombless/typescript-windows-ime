@@ -824,8 +824,10 @@ const bool intersects = rect.right > capture.x && rect.bottom > capture.y &&
         intersects ? "yes" : "no", capture.x, capture.y, capture.width, capture.height, hits, white,
         grey);
     {
-        const LONG sampleX = rect.left + rect.right - rect.left / 2;
-        const LONG sampleY = rect.top + rect.bottom - rect.top / 2;
+        // Use the actual midpoint of the target rectangle; the old operator
+        // precedence sampled outside the window for non-zero screen origins.
+        const LONG sampleX = rect.left + (rect.right - rect.left) / 2;
+        const LONG sampleY = rect.top + (rect.bottom - rect.top) / 2;
         const int row = static_cast<int>(sampleY - capture.y);
         const int column = static_cast<int>(sampleX - capture.x);
         if (row >= 0 && row < capture.height && column >= 0 && column < capture.width) {

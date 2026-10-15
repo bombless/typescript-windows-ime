@@ -38,6 +38,13 @@ std::wstring PipeName(const wchar_t* base) {
 
 std::atomic<bool> g_running{true};
 bool g_trayTestMode = false;
+// Opt-in diagnostic mode: keep the last candidate list on screen when TSF
+// deactivates or sends hideCandidates. Never enabled in normal launches.
+bool KeepCandidatesForDebug() {
+    wchar_t value[8]{};
+    const DWORD length = GetEnvironmentVariableW(L"TSWIME_KEEP_CANDIDATES", value, ARRAYSIZE(value));
+    return length > 0 && length < ARRAYSIZE(value) && _wtoi(value) != 0;
+}
 std::mutex g_clientsMutex;
 std::condition_variable g_clientsChanged;
 
@@ -389,7 +396,14 @@ bool HandleCandidateNotification(const std::string& line, unsigned long long ses
     if (!show && !hide) return false;
     std::lock_guard<std::mutex> renderLock(g_renderMutex);
     if (hide) {
-        if (g_renderOwnerSession == session) { CandidateWindow::Hide(); g_renderOwnerSession = 0; }
+        if (g_renderOwnerSession == session) {
+            if (KeepCandidatesForDebug()) {
+                NativeLog::Write("CandidateWindow debug hold: ignoring hideCandidates session=%llu", session);
+            } else {
+                CandidateWindow::Hide();
+                g_renderOwnerSession = 0;
+            }
+        }
         return true;
     }
     RECT caret{};
@@ -570,7 +584,13 @@ void ServeTsfClient(HANDLE pipe) {
         }
         // Outside both locks: Hide is a request to the candidate window's own
         // thread and must not be issued while holding either mutex.
-        if (hideMine) CandidateWindow::Hide();
+        if (hideMine) {
+            if (KeepCandidatesForDebug()) {
+                NativeLog::Write("CandidateWindow debug hold: keeping list after TSF session close session=%llu", session);
+            } else {
+                CandidateWindow::Hide();
+            }
+        }
     } else {
         // Accepted but never sent a line carrying a session id, so the client
         // cannot be named. Without this the connection would vanish from the
