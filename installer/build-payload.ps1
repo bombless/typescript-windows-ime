@@ -1,5 +1,8 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+$nativeBuild = Join-Path $root 'native\build.ps1'
+& $nativeBuild -Flavor Release
+if ($LASTEXITCODE -ne 0) { throw 'Native Release build failed; refusing to package a Dev DLL as Release.' }
 $payload = Join-Path $root 'artifacts\payload'
 if (Test-Path $payload) { Remove-Item $payload -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $payload | Out-Null
@@ -12,7 +15,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $payload 'native\install') 
 # native\install. Those files can intentionally remain old while TSF is still
 # using a versioned DLL, which otherwise silently ships stale candidate-window
 # painting and Host behavior in a newly built MSI.
-$builtDll = Join-Path $root 'native\build\TypeScriptWindowsIme.dll'
+$builtDll = Join-Path $root 'native\build\release\TypeScriptWindowsIme.dll'
 $builtHost = Join-Path $root 'native\build\TypeScriptWindowsImeHost.exe'
 foreach ($artifact in @($builtDll, $builtHost)) {
     if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {

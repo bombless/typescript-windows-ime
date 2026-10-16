@@ -20,7 +20,7 @@ Get-Process -Name 'TypeScriptWindowsImeHost', 'PipeBridgeTest' -ErrorAction Sile
     Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
 }
 
-$clsid = '{7B2E4F5A-3A8E-4D74-9F0B-6D5D6F0E6C41}'
+$clsid = '{A6C63D91-DF29-4D11-8F9A-21DCE63B4E10}'
 $system32 = Join-Path $env:WINDIR 'System32'
 $reg = Join-Path $system32 'reg.exe'
 $regsvr32 = Join-Path $system32 'regsvr32.exe'

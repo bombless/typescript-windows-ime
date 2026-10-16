@@ -1,3 +1,4 @@
+param([ValidateSet("Dev", "Release")][string]$Flavor = "Dev")
 $ErrorActionPreference = "Stop"
 
 function Find-VsDevCmd {
@@ -125,13 +126,15 @@ try {
 
     # Build artifacts stay under native\\build. The installable DLL is copied
     # into native\\install by the installer and is never touched by this script.
-    $dll = Join-Path $out "TypeScriptWindowsIme.dll"
+    $dll = if ($Flavor -eq "Release") { Join-Path $out "release\TypeScriptWindowsIme.dll" } else { Join-Path $out "TypeScriptWindowsIme.dll" }
+if ($Flavor -eq "Release") { New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dll) | Out-Null }
     $stagedDll = Join-Path $staging "TypeScriptWindowsIme.dll"
     $stagedLib = Join-Path $staging "TypeScriptWindowsIme.lib"
     $stagedExp = Join-Path $staging "TypeScriptWindowsIme.exp"
 
     Remove-Item $stagedDll, $stagedLib, $stagedExp -Force -ErrorAction SilentlyContinue
-    cl.exe /nologo /std:c++17 /EHsc /W4 /LD TsIme.cpp "$out\PipeBridge.obj" /link /OUT:"$stagedDll" /IMPLIB:"$stagedLib" /DEF:"TsIme.def" /SUBSYSTEM:WINDOWS advapi32.lib ole32.lib oleaut32.lib user32.lib gdi32.lib
+    $flavorDefine = if ($Flavor -eq "Release") { "/DTSIME_RELEASE=1" } else { "/DTSIME_DEV=1" }
+    cl.exe /nologo /std:c++17 /EHsc /W4 $flavorDefine /LD TsIme.cpp "$out\PipeBridge.obj" /link /OUT:"$stagedDll" /IMPLIB:"$stagedLib" /DEF:"TsIme.def" /SUBSYSTEM:WINDOWS advapi32.lib ole32.lib oleaut32.lib user32.lib gdi32.lib
     if ($LASTEXITCODE -ne 0) { throw "Failed to link TypeScriptWindowsIme.dll." }
 
     if (Test-Path $dll) {

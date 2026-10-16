@@ -1485,6 +1485,12 @@ HRESULT SetRegString(HKEY root, const wchar_t* subKey, const wchar_t* valueName,
     return HRESULT_FROM_WIN32(result);
 }
 
+#ifdef TSIME_RELEASE
+constexpr wchar_t kClsidRegistryPath[] = L"CLSID\\\\{A6C63D91-DF29-4D11-8F9A-21DCE63B4E10}";
+#else
+constexpr wchar_t kClsidRegistryPath[] = L"CLSID\\\\{7B2E4F5A-3A8E-4D74-9F0B-6D5D6F0E6C41}";
+#endif
+
 HRESULT RegisterComServer() {
     HMODULE module = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -1497,21 +1503,22 @@ HRESULT RegisterComServer() {
     if (length == 0 || length == ARRAYSIZE(modulePath))
         return HRESULT_FROM_WIN32(GetLastError());
 
-    const wchar_t* clsid = L"CLSID\\{7B2E4F5A-3A8E-4D74-9F0B-6D5D6F0E6C41}";
+    const wchar_t* clsid = kClsidRegistryPath;
+    const std::wstring inproc = std::wstring(clsid) + L"\\InprocServer32";
     HRESULT hr = SetRegString(HKEY_CLASSES_ROOT, clsid, nullptr, kTypeScriptWindowsImeName);
     if (FAILED(hr)) return hr;
     hr = SetRegString(HKEY_CLASSES_ROOT,
-        L"CLSID\\{7B2E4F5A-3A8E-4D74-9F0B-6D5D6F0E6C41}\\InprocServer32",
+        inproc.c_str(),
         nullptr, modulePath);
     if (FAILED(hr)) return hr;
     return SetRegString(HKEY_CLASSES_ROOT,
-        L"CLSID\\{7B2E4F5A-3A8E-4D74-9F0B-6D5D6F0E6C41}\\InprocServer32",
+        inproc.c_str(),
         L"ThreadingModel", L"Apartment");
 }
 
 HRESULT UnregisterComServer() {
     const LSTATUS result = RegDeleteTreeW(HKEY_CLASSES_ROOT,
-        L"CLSID\\{7B2E4F5A-3A8E-4D74-9F0B-6D5D6F0E6C41}");
+        kClsidRegistryPath);
     if (result == ERROR_FILE_NOT_FOUND) return S_OK;
     return HRESULT_FROM_WIN32(result);
 }

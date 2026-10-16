@@ -6,6 +6,7 @@ $version = Get-Date -Format "yyyyMMdd-HHmmssfff"
 $dll = Join-Path $installDir "TypeScriptWindowsIme-$version.dll"
 $clsid = "{7B2E4F5A-3A8E-4D74-9F0B-6D5D6F0E6C41}"
 $profile = "{C0A3B5B1-3C52-4E8E-A8A7-1F2B3D4C5E60}"
+$displayName = "TypeScript Windows IME Dev"
 if (-not (Test-Path $buildDll)) { throw "Native build DLL not found: $buildDll. Run .\build.ps1 first." }
 
 # Windows loads the DLL the COM registration points at, so installing a build
@@ -69,7 +70,7 @@ $reg = Join-Path $env:WINDIR "System32\reg.exe"
 # explicit write makes this script robust when registry redirection is active.
 $clsidKey = "HKLM\SOFTWARE\Classes\CLSID\$clsid"
 $inprocKey = "$clsidKey\InprocServer32"
-& $reg add $clsidKey /ve /t REG_SZ /d "TypeScript Windows IME (C++)" /f | Out-Null
+& $reg add $clsidKey /ve /t REG_SZ /d $displayName /f | Out-Null
 & $reg add $inprocKey /ve /t REG_SZ /d $dll /f | Out-Null
 & $reg add $inprocKey /v ThreadingModel /t REG_SZ /d Apartment /f | Out-Null
 $comQuery = & $reg query $inprocKey /ve 2>$null
@@ -111,4 +112,4 @@ $ctfmon = Join-Path $env:WINDIR "System32\ctfmon.exe"
 if (-not (Test-Path $ctfmon)) { throw "ctfmon.exe was not found at '$ctfmon'." }
 Get-Process ctfmon -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Process -FilePath $ctfmon
-Write-Host "Restart the target application and select 'TypeScript Windows IME (C++)'."
+Write-Host "Restart the target application and select '$displayName'."

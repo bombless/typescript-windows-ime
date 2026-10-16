@@ -1,16 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="TypeScript Windows IME" Manufacturer="bombless" Version="$(var.ProductVersion)" UpgradeCode="3A8D03C1-DF23-4C39-AF6D-58D4F7E4B7A1" Scope="perMachine">
+  <Package Name="TypeScript Windows IME Release" Manufacturer="bombless" Version="$(var.ProductVersion)" UpgradeCode="3A8D03C1-DF23-4C39-AF6D-58D4F7E4B7A1" Scope="perMachine">
     <MajorUpgrade DowngradeErrorMessage="A newer version of TypeScript Windows IME is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <StandardDirectory Id="ProgramFiles64Folder"><Directory Id="INSTALLFOLDER" Name="TypeScriptWindowsIme" /></StandardDirectory>
-    <Feature Id="MainFeature" Title="TypeScript Windows IME" Level="1">
+    <Feature Id="MainFeature" Title="TypeScript Windows IME Release" Level="1">
       <ComponentGroupRef Id="AppFiles" />
       <ComponentRef Id="StartupEntries" />
     </Feature>
     <Component Id="StartupEntries" Directory="INSTALLFOLDER" Guid="*">
-      <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="TypeScriptWindowsImeHost" Type="string" Value="powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command &quot;Start-Process -WindowStyle Hidden -FilePath '[INSTALLFOLDER]native\install\TypeScriptWindowsImeHost.exe'&quot;" KeyPath="yes" />
-      <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="TypeScriptWindowsImeDev" Type="string" Value="wscript.exe &quot;[INSTALLFOLDER]installer\launch-hidden.vbs&quot;" />
+      <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="TypeScriptWindowsImeReleaseHost" Type="string" Value="powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command &quot;Start-Process -WindowStyle Hidden -FilePath '[INSTALLFOLDER]native\install\TypeScriptWindowsImeHost.exe'&quot;" KeyPath="yes" />
+      <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="TypeScriptWindowsImeRelease" Type="string" Value="wscript.exe &quot;[INSTALLFOLDER]installer\launch-hidden.vbs&quot;" />
     </Component>
     <CustomAction Id="RegisterTsf" Directory="INSTALLFOLDER" ExeCommand="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]installer\register-tsf.ps1&quot;" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="UnregisterTsf" Directory="INSTALLFOLDER" ExeCommand="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]installer\unregister-tsf.ps1&quot;" Execute="deferred" Impersonate="no" Return="ignore" />

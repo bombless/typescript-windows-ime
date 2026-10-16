@@ -12,10 +12,11 @@ function Write-InstallerLog([string]$message) {
     Write-Host $entry
 }
 
-Write-InstallerLog "Starting TSF registration..."
+Write-InstallerLog "Starting TSF registration for TypeScript Windows IME Release..."
 
-$clsid = '{7B2E4F5A-3A8E-4D74-9F0B-6D5D6F0E6C41}'
-$profile = '{C0A3B5B1-3C52-4E8E-A8A7-1F2B3D4C5E60}'
+$clsid = '{A6C63D91-DF29-4D11-8F9A-21DCE63B4E10}'
+$profile = '{F2E94A73-8D2B-4F6C-AE31-5D7C903B12A8}'
+$displayName = 'TypeScript Windows IME Release'
 $system32 = Join-Path $env:WINDIR 'System32'
 $reg = Join-Path $system32 'reg.exe'
 $regsvr32 = Join-Path $system32 'regsvr32.exe'
@@ -77,7 +78,7 @@ Write-InstallerLog "Checking TSF profile key: $profileKey"
 & $reg query $profileKey 2>$null | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Write-InstallerLog "WARNING: Profile key missing after regsvr32, creating manually..."
-    & $reg add $profileKey /v Description /t REG_SZ /d "TypeScript Windows IME (C++)" /f 2>$null | Out-Null
+    & $reg add $profileKey /v Description /t REG_SZ /d $displayName /f 2>$null | Out-Null
 }
 
 Write-InstallerLog "Enabling TSF language profile..."
