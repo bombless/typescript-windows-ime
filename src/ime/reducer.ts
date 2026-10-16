@@ -20,10 +20,13 @@ export function reduceKey(state: ImeState, event: KeyMessage): Reduction {
   }
   // Shift is reported as a standalone key before the key it modifies. If
   // that next key is a shifted symbol (for example ':' from Shift+;), the
-  // Shift press was not a mode-toggle tap: restore the original mode.
+  // Shift press was not a mode-toggle tap: restore the original mode. In
+  // English mode, Shift+letter must also remain English; passing the key
+  // through lets Windows apply normal Shift/Caps Lock casing rules.
   if (state.shiftToggleOrigin) {
     const { shiftToggleOrigin, ...rest } = state;
-    if ((event.modifiers & 1) !== 0 && !/^[A-Za-z]$/.test(key)) {
+    if ((event.modifiers & 1) !== 0 &&
+        (shiftToggleOrigin === "english" || !/^[A-Za-z]$/.test(key))) {
       state = { ...rest, mode: shiftToggleOrigin };
       mode = shiftToggleOrigin;
     } else {

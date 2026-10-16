@@ -204,6 +204,19 @@ describe("initial key behavior", () => {
     expect(colon.state.shiftToggleOrigin).toBeUndefined();
   });
 
+  it("keeps English mode for Shift+letter and lets Windows apply Caps Lock casing", () => {
+    const english = { composition: "", selectedCandidate: 0, mode: "english" as const };
+    const shift = reduceKey(english, {
+      id: 214, session: 1, type: "keyDown", vk: 0x10, scanCode: 0x2a, key: "Shift", modifiers: 1,
+    });
+    expect(shift.state).toMatchObject({ mode: "chinese", shiftToggleOrigin: "english" });
+
+    const shiftedLetter = reduceKey(shift.state, {
+      id: 215, session: 1, type: "keyDown", vk: 0x41, scanCode: 0x1e, key: "A", modifiers: 1,
+    });
+    expect(shiftedLetter).toEqual({ state: english, consume: false });
+  });
+
   it("preflights Shift+semicolon so TSF calls keyDown to restore English mode", async () => {
     const { SimpleEngine } = await import("../src/ime/engine.js");
     const engine = new SimpleEngine();
@@ -285,6 +298,38 @@ describe("initial key behavior", () => {
     expect(getKnownWordEntries("项目").length).toBeGreaterThan(0);
     expect(getKnownWordEntries("的").length).toBeGreaterThan(1);
     expect(getKnownWordEntries("这不是词典里的词")).toEqual([]);
+  });
+
+  it("prioritizes known dictionary words over synthetic combinations in continuation fallback", () => {
+    // "biaozhif" has no direct match in dictionaries, but continuation produces "标识符" (known word)
+    // as well as synthetic combinations like "标志发".
+    const candidates = getCandidates("biaozhif");
+    expect(candidates.length).toBeGreaterThan(0);
+    expect(candidates[0].text).toBe("标识符");
+    expect(getKnownWordEntries(candidates[0].text).length).toBeGreaterThan(0);
+
+    const firstSyntheticIndex = candidates.findIndex((c) => getKnownWordEntries(c.text).length === 0);
+    expect(firstSyntheticIndex).toBeGreaterThan(0);
+
+    // Another example: "paimaix" -> "拍卖行" should rank before synthetic entries like "拍卖下"
+    const paimaiCandidates = getCandidates("paimaix");
+    expect(paimaiCandidates.length).toBeGreaterThan(0);
+    expect(paimaiCandidates[0].text).toBe("拍卖行");
+  });
+
+  it("ranks known word entries by sourcePriority, priority, and weight", () => {
+    const entries = getKnownWordEntries("高级人才");
+    expect(entries.length).toBeGreaterThanOrEqual(2);
+    // Primary dictionary (sourcePriority: 1) must precede Microsoft dictionary (sourcePriority: 2)
+    expect(entries[0].sourcePriority).toBe(1);
+    expect(entries[0].weight).toBeGreaterThan(1);
+
+    const msEntries = entries.filter((e) => e.sourcePriority === 2);
+    expect(msEntries.length).toBeGreaterThan(0);
+    // Microsoft dictionary entries have fixed weight = 1
+    for (const msEntry of msEntries) {
+      expect(msEntry.weight).toBe(1);
+    }
   });
 
   it("keeps continuation fallback deterministic, deduplicated, and bounded", () => {
