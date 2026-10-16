@@ -6,6 +6,11 @@
 #include <ctfutb.h>
 #include <ocidl.h>
 
+// The SDK's uuid.lib provides this GUID definition, but some SDK headers do
+// not declare it. Declare the external symbol instead of defining it here.
+EXTERN_C const GUID GUID_LBI_INPUTMODE;
+
+
 #include <new>
 #include <atomic>
 #include <mutex>
@@ -47,15 +52,16 @@ void LogTsfViewGeometry(const char* tag, ITfContextView* view) {
         cs.left, cs.top, cs.right, cs.bottom, hwnd && IsWindowVisible(hwnd) ? 1 : 0,
         hwnd && IsIconic(hwnd) ? 1 : 0);
 }
+
 class TextService;
 
-// TSF language-bar item: Node's mode response drives the visible CN/EN label.
-DEFINE_GUID(GUID_TsImeLangBarItem, 0x4f77a7b1, 0x2d31, 0x4c62, 0x91, 0x42, 0x38, 0x1b, 0x9e, 0x50, 0x7c, 0x11);
-
 HICON CreateLangBarModeIcon(bool chinese) {
-    const int cx = GetSystemMetrics(SM_CXSMICON);
-    const int cy = GetSystemMetrics(SM_CYSMICON);
+    UINT dpi = GetDpiForSystem();
+    if (!dpi) dpi = 96;
+    const int cx = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+    const int cy = GetSystemMetricsForDpi(SM_CYSMICON, dpi);
     const int size = (cx > 0 && cy > 0) ? (cx < cy ? cx : cy) : 16;
+
     HDC screen = GetDC(nullptr);
     if (!screen) {
         NativeLog::Write("ModeLangBarItem CreateIcon GetDC failed error=%lu", GetLastError());
@@ -74,6 +80,12 @@ HICON CreateLangBarModeIcon(bool chinese) {
         ReleaseDC(nullptr, screen);
         return nullptr;
     }
+
+    // Initialize monochrome AND mask to 0 (fully opaque) to prevent random XOR artifacts.
+    HGDIOBJ oldMask = SelectObject(memory, mask);
+    PatBlt(memory, 0, 0, size, size, BLACKNESS);
+    SelectObject(memory, oldMask);
+
     HGDIOBJ old = SelectObject(memory, color);
     RECT bounds{0, 0, size, size};
     HBRUSH background = CreateSolidBrush(chinese ? RGB(190, 45, 45) : RGB(35, 105, 190));
@@ -121,7 +133,7 @@ public:
         AddRef(); return S_OK;
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
-    ULONG STDMETHODCALLTYPE Release() override { ULONG n=static_cast<ULONG>(InterlockedDecrement(&refs_)); if (!n) delete this; return n; }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG n = static_cast<ULONG>(InterlockedDecrement(&refs_)); if (!n) delete this; return n; }
     void SetMode(bool chinese) {
         if (chinese_ != chinese) {
             chinese_ = chinese;
@@ -129,55 +141,62 @@ public:
         }
     }
     HRESULT STDMETHODCALLTYPE GetInfo(TF_LANGBARITEMINFO* i) override {
-        if (!i) return E_POINTER; ZeroMemory(i,sizeof(*i)); i->clsidService=CLSID_TypeScriptWindowsIme;
-        i->guidItem=GUID_TsImeLangBarItem; i->dwStyle=TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_BTN_TOGGLE | TF_LBI_STYLE_SHOWNINTRAY;
-        i->ulSort=0; wcsncpy_s(i->szDescription,L"TypeScript Windows IME mode",_TRUNCATE); return S_OK;
+        if (!i) return E_POINTER;
+        ZeroMemory(i, sizeof(*i));
+        i->clsidService = CLSID_TypeScriptWindowsIme;
+        // Use standard GUID_LBI_INPUTMODE so Windows 10/11 system tray displays the mode indicator.
+        i->guidItem = GUID_LBI_INPUTMODE;
+        i->dwStyle = TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_SHOWNINTRAY;
+        i->ulSort = 0;
+        wcsncpy_s(i->szDescription, L"TypeScript Windows IME mode", _TRUNCATE);
+        return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetStatus(DWORD* s) override {
         if (!s) return E_POINTER;
-        // This item advertises TF_LBI_STYLE_BTN_TOGGLE, so report the actual
-        // toggle state instead of permanently claiming that it is unchecked.
-        *s = chinese_ ? TF_LBI_STATUS_BTN_TOGGLED : 0;
+        *s = 0;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE Show(BOOL) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetTooltipString(BSTR* s) override {
-        if(!s)return E_POINTER;
-        *s=SysAllocString(chinese_?L"TypeScript Windows IME - 中文":L"TypeScript Windows IME - 英文");
-        return *s?S_OK:E_OUTOFMEMORY;
+        if (!s) return E_POINTER;
+        *s = SysAllocString(chinese_ ? L"TypeScript Windows IME - 中文" : L"TypeScript Windows IME - 英文");
+        return *s ? S_OK : E_OUTOFMEMORY;
     }
     HRESULT STDMETHODCALLTYPE OnClick(TfLBIClick click, POINT pt, const RECT* prcArea) override;
     HRESULT STDMETHODCALLTYPE InitMenu(ITfMenu*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE OnMenuSelect(UINT) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetIcon(HICON* i) override {
-        if(!i)return E_POINTER;
+        if (!i) return E_POINTER;
         *i = CreateLangBarModeIcon(chinese_);
         return *i ? S_OK : E_FAIL;
     }
-    HRESULT STDMETHODCALLTYPE GetText(BSTR* s) override { if(!s)return E_POINTER; *s=SysAllocString(chinese_?L"\u4E2D":L"\u82F1"); return *s?S_OK:E_OUTOFMEMORY; }
-    HRESULT STDMETHODCALLTYPE AdviseSink(REFIID iid,IUnknown* punk,DWORD* cookie) override {
-        if(!punk||!cookie)return E_POINTER; if(iid!=IID_ITfLangBarItemSink)return E_NOINTERFACE;
-        if(sink_)return E_UNEXPECTED; HRESULT hr=punk->QueryInterface(IID_ITfLangBarItemSink,reinterpret_cast<void**>(&sink_));
-        if(SUCCEEDED(hr)){cookie_=1;*cookie=cookie_;} return hr;
+    HRESULT STDMETHODCALLTYPE GetText(BSTR* s) override {
+        if (!s) return E_POINTER;
+        *s = SysAllocString(chinese_ ? L"\u4E2D" : L"\u82F1");
+        return *s ? S_OK : E_OUTOFMEMORY;
     }
-    HRESULT STDMETHODCALLTYPE UnadviseSink(DWORD cookie) override { if(!sink_||cookie!=cookie_)return E_INVALIDARG; sink_->Release();sink_=nullptr;cookie_=0;return S_OK; }
+    HRESULT STDMETHODCALLTYPE AdviseSink(REFIID iid, IUnknown* punk, DWORD* cookie) override {
+        if (!punk || !cookie) return E_POINTER;
+        if (iid != IID_ITfLangBarItemSink) return E_NOINTERFACE;
+        if (sink_) return E_UNEXPECTED;
+        HRESULT hr = punk->QueryInterface(IID_ITfLangBarItemSink, reinterpret_cast<void**>(&sink_));
+        if (SUCCEEDED(hr)) { cookie_ = 1; *cookie = cookie_; }
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE UnadviseSink(DWORD cookie) override {
+        if (!sink_ || cookie != cookie_) return E_INVALIDARG;
+        sink_->Release(); sink_ = nullptr; cookie_ = 0; return S_OK;
+    }
 private:
     LONG refs_; bool chinese_; ITfLangBarItemSink* sink_; DWORD cookie_;
     TextService* service_;
 };
-class TextService;
-
 
 volatile LONG g_serverLocks = 0;
 volatile LONG g_objectCount = 0;
 constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf";
-// Where the text service looks for the core. KeyHandlingMockTest points this
-// at a private pipe so its scripted core cannot race a running Host; nothing
-// in production ever changes it.
 const wchar_t* g_servicePipeName = kPipeName;
 
-// The candidate window asks for the caret rectangle from a timer, so the
-// service that owns the current composition has to be reachable from there.
 TextService* g_activeService = nullptr;
 HWND g_caretRetryWindow = nullptr;
 constexpr UINT_PTR kCaretRetryTimer = 1;
@@ -185,20 +204,14 @@ constexpr int kCaretRetryDelayMs = 40;
 constexpr int kCaretRetries = 12;
 bool CreateCaretRetryWindow();
 void DestroyCaretRetryWindow();
-// TSF activates one text service per application process and the Host
-// multiplexes every one of them over a single Node connection. Request ids
-// restart at 1 in each process, so they cannot identify a request on their
-// own. A session id that is unique per process lets the Host route each
-// response back to the client that asked, and lets Node keep one composition
-// per application instead of one shared composition.
+
 std::atomic<unsigned long long> g_nextSessionId{1};
 unsigned long long AllocateSessionId() {
     const unsigned long long processId = GetCurrentProcessId();
-    // The low bits hold a per-process counter, the high bits the pid. Shifting
-    // the pid up keeps the value inside the safe-integer range Node validates.
     const unsigned long long counter = g_nextSessionId.fetch_add(1) - 1;
     return (processId << 20) | (counter & 0xfffff);
 }
+
 void LogForegroundContext(const char* where, ITfContext* context) {
     const HWND foreground = GetForegroundWindow();
     DWORD pid = 0;
@@ -341,11 +354,6 @@ std::vector<std::wstring> WideCandidates(const std::vector<std::string>& candida
     return wide;
 }
 
-class TextService;
-
-// Re-reads the caret rectangle of the live composition. Applications lay out
-// composition text after the edit session that inserted it, so the first
-// ITfContextView::GetTextExt call often reports nothing useful.
 class CaretProbeSession final : public ITfEditSession {
 public:
     CaretProbeSession(ITfContext* context, ITfComposition* composition, RECT* caret)
@@ -485,7 +493,7 @@ public:
         if (!count) delete this;
         return count;
     }
-HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie ec) override {
+    HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie ec) override {
         if (!context_) return E_UNEXPECTED;
 
         ITfContextComposition* contextComposition = nullptr;
@@ -497,9 +505,6 @@ HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie ec) override {
 
         if (text_.empty()) {
             if (composition_) {
-                // Ending a TSF composition does not erase the text it owns.
-                // Clear the range first, or the next composition can be
-                // inserted after stale pinyin (for example, producing "abc").
                 ITfRange* emptyRange = nullptr;
                 hr = composition_->GetRange(&emptyRange);
                 if (SUCCEEDED(hr) && emptyRange) {
@@ -523,8 +528,6 @@ HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie ec) override {
         }
 
         if (composition_) {
-            // An application may end the composition behind our back. A dead
-            // ITfComposition must not poison every later edit session.
             ITfRange* probe = nullptr;
             if (FAILED(composition_->GetRange(&probe)) || !probe) {
                 NativeLog::Write("CompositionEditSession stale composition discarded");
@@ -583,10 +586,6 @@ HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie ec) override {
             if (SUCCEEDED(hr)) {
                 ReadCaretRect(ec, range);
 
-                // SetText replaces the composition text, but relying on the
-                // application's implicit selection update can leave the caret
-                // at the beginning of the newly inserted candidate. Explicitly
-                // place the TSF selection at the end of the updated range.
                 ITfRange* caretRange = nullptr;
                 HRESULT caretHr = range->Clone(&caretRange);
                 if (SUCCEEDED(caretHr) && caretRange) {
@@ -653,11 +652,7 @@ HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie ec) override {
         return hr;
     }
 
-    // Screen coordinates of the insertion point at the end of the composition.
-    // The candidate window is drawn there. Applications that do not implement
-    // ITfContextView leave this empty and the window falls back to the caret.
     const RECT& CaretRect() const { return caretRect_; }
-
     HRESULT Result() const { return hr_; }
 private:
     void ReadCaretRect(TfEditCookie ec, ITfRange* range) {
@@ -666,9 +661,6 @@ private:
             return;
         }
         LogTsfViewGeometry("CompositionSink", view);
-        // The insertion point anchors the window. Applications that have not
-        // laid out the fresh composition yet fail on the collapsed range, so
-        // the whole composition rectangle is used as the fallback anchor.
         ITfRange* end = nullptr;
         if (SUCCEEDED(range->Clone(&end)) && end) {
             end->Collapse(ec, TF_ANCHOR_END);
@@ -695,8 +687,6 @@ private:
     ITfComposition* composition_ = nullptr;
 };
 
-class TextService;
-
 class KeyEventSink final : public ITfKeyEventSink {
 public:
     explicit KeyEventSink(TextService* service) : refCount_(1), service_(service) {}
@@ -719,17 +709,15 @@ private:
     TextService* service_;
 };
 
-// XAML/WinUI hosts (Windows Terminal, modern Store apps) drive the Windows 8+
-// text stack and only ever ask for IID_ITfTextInputProcessorEx. A TIP that
-// exposes the plain ITfTextInputProcessor alone is skipped by the IME switcher
-// in those windows, so the extended interface is not optional here.
-class TextService final : public ITfTextInputProcessorEx {
+class TextService final : public ITfTextInputProcessorEx, public ITfCompartmentEventSink {
 public:
     TextService()
         : refCount_(1), threadMgr_(nullptr), keyMgr_(nullptr), keySink_(nullptr),
           clientId_(TF_CLIENTID_NULL), keySinkAdvised_(false), nextRequestId_(1),
           sessionId_(AllocateSessionId()), pipe_(250), compositionContext_(nullptr),
-          activateFlags_(0), activatedViaEx_(false), langBarMgr_(nullptr), langBarItem_(nullptr) {
+          activateFlags_(0), activatedViaEx_(false), langBarMgr_(nullptr), langBarItem_(nullptr),
+          conversionCompartment_(nullptr), conversionSinkCookie_(TF_INVALID_COOKIE),
+          updatingCompartment_(false) {
         InterlockedIncrement(&g_objectCount);
     }
 
@@ -748,6 +736,11 @@ public:
         }
         if (riid == IID_ITfTextInputProcessor) {
             *object = static_cast<ITfTextInputProcessor*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (riid == IID_ITfCompartmentEventSink) {
+            *object = static_cast<ITfCompartmentEventSink*>(this);
             AddRef();
             return S_OK;
         }
@@ -795,13 +788,7 @@ public:
         NativeLog::Write("TextService::Activate AdviseKeyEventSink clientId=%lu hr=0x%08lX advised=%d",
             static_cast<unsigned long>(clientId_), static_cast<unsigned long>(hr), keySinkAdvised_ ? 1 : 0);
 
-        // The pipe server belongs to the activated TSF instance, not to an
-        // individual key event. Start accepting Node clients immediately so
-        // Node can connect as soon as the IME is active.
-        // IPC is optional during activation. TSF activation must remain fast
-        // even when the Node/host process is not running yet; key handling
-        // will use the short reconnect path below.
-const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
+        const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
         NativeLog::Write("TextService::Activate pipe connect=%d", pipeConnected ? 1 : 0);
         HRESULT langHr = threadMgr_->QueryInterface(IID_ITfLangBarItemMgr, reinterpret_cast<void**>(&langBarMgr_));
         if (SUCCEEDED(langHr) && langBarMgr_) {
@@ -813,6 +800,9 @@ const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
         }
         NativeLog::Write("TextService::Activate language-bar registration hr=0x%08lX item=%p",
             static_cast<unsigned long>(langHr), langBarItem_);
+
+        AdviseConversionCompartmentSink();
+
         currentModeIsChinese_ = true;
         SetInputModeCompartments(true);
         if (langBarItem_) langBarItem_->SetMode(true);
@@ -825,11 +815,6 @@ const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
 
     HRESULT STDMETHODCALLTYPE ActivateEx(ITfThreadMgr* threadMgr, TfClientId clientId,
                                          DWORD flags) override {
-        // The candidate list is drawn by the Host process and the edits go
-        // through ITfContext, so the TF_TMAE_* hints (secure mode, 16-bit
-        // hosts, console-only activation) do not change what has to happen
-        // here. Run the same activation so the key sink is advised identically
-        // on both paths.
         NativeLog::Write("TextService::ActivateEx enter this=%p clientId=%lu flags=0x%08lX secure=%d "
                          "uielementOnly=%d noActivateTip=%d console=%d wow16=%d",
             this, static_cast<unsigned long>(clientId), static_cast<unsigned long>(flags),
@@ -837,7 +822,6 @@ const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
             (flags & TF_TMAE_NOACTIVATETIP) ? 1 : 0, (flags & TF_TMAE_CONSOLE) ? 1 : 0,
             (flags & TF_TMAE_WOW16) ? 1 : 0);
         const HRESULT hr = Activate(threadMgr, clientId);
-        // Activate runs Deactivate first, so the state is only final here.
         activateFlags_ = flags;
         activatedViaEx_ = SUCCEEDED(hr);
         NativeLog::Write("TextService::ActivateEx result hr=0x%08lX", static_cast<unsigned long>(hr));
@@ -847,6 +831,7 @@ const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
     HRESULT STDMETHODCALLTYPE Deactivate() override {
         NativeLog::Write("TextService::Deactivate enter this=%p clientId=%lu advised=%d viaEx=%d", this,
             static_cast<unsigned long>(clientId_), keySinkAdvised_ ? 1 : 0, activatedViaEx_ ? 1 : 0);
+        UnadviseConversionCompartmentSink();
         if (keyMgr_ && keySink_ && keySinkAdvised_ && clientId_ != TF_CLIENTID_NULL) {
             const HRESULT hr = keyMgr_->UnadviseKeyEventSink(clientId_);
             NativeLog::Hr("TextService::Deactivate UnadviseKeyEventSink", hr);
@@ -868,9 +853,6 @@ const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
             threadMgr_ = nullptr;
         }
         clientId_ = TF_CLIENTID_NULL;
-        // The list lives on the Host's own window, not on this document: the
-        // service is going away and has to take it down before the pipe it is
-        // sent on is disconnected.
         HideCandidates();
         pipe_.Disconnect();
         compositionContext_ = nullptr;
@@ -889,27 +871,43 @@ const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
         return S_OK;
     }
 
-bool TestKey(ITfContext*, WPARAM wParam, LPARAM, bool& consume);
+    // ITfCompartmentEventSink
+    HRESULT STDMETHODCALLTYPE OnChange(REFGUID rguid) override {
+        if (updatingCompartment_ || rguid != GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION || !conversionCompartment_) {
+            return S_OK;
+        }
+        VARIANT val;
+        VariantInit(&val);
+        if (SUCCEEDED(conversionCompartment_->GetValue(&val)) && val.vt == VT_I4) {
+            const bool isChinese = (val.lVal & TF_CONVERSIONMODE_NATIVE) != 0;
+            if (isChinese != currentModeIsChinese_) {
+                NativeLog::Write("ITfCompartmentEventSink::OnChange external mode change to %s", isChinese ? "chinese" : "english");
+                currentModeIsChinese_ = isChinese;
+                if (langBarItem_) langBarItem_->SetMode(isChinese);
+                std::lock_guard<std::mutex> callLock(callCoreMutex_);
+                if (pipe_.IsConnected() || pipe_.ConnectToServer(g_servicePipeName, 50)) {
+                    const std::string confirmed = "{\"id\":0,\"session\":" + std::to_string(sessionId_) +
+                        ",\"type\":\"modeApplied\",\"mode\":\"" + (isChinese ? "chinese" : "english") + "\"}";
+                    pipe_.Notify(confirmed);
+                }
+            }
+        }
+        VariantClear(&val);
+        return S_OK;
+    }
+
+    bool TestKey(ITfContext*, WPARAM wParam, LPARAM, bool& consume);
     bool HandleKey(ITfContext* context, WPARAM wParam, LPARAM, bool& consume);
     void LogActiveProfile(const char* where) const;
     void OnCompositionTerminated();
     bool ProbeCaretRect(RECT& caret);
     void RetryCaret();
-    // The list is drawn on the Host's own window, so it does not follow the
-    // caret: the key sink calls these when TSF moves the focus to or from this
-    // thread, and Deactivate calls Hide before the pipe goes away.
     void HideCandidates();
     void ShowCandidatesForComposition();
-    // Lets the adapter tests assert that both activation paths really advise
-    // the key sink instead of inferring it from log output.
     bool KeySinkAdvised() const { return keySinkAdvised_; }
-    // Lets the adapter tests assert that ActivateEx ran its own body and kept
-    // the TF_TMAE_* hints the modern stack passed in.
     DWORD ActivateFlags() const { return activateFlags_; }
-    // KeyEventSink uses narrow wrappers for diagnostic logging.
     int CurrentModifiers() { return Modifiers(); }
     static std::string DiagnosticKeyName(WPARAM vk) { return KeyName(vk); }
-    // Deterministic modifier injection for the native mock test; disabled by default.
     void SetModifierOverrideForTest(int modifiers) { modifierOverrideForTest_ = modifiers; }
     void ToggleMode();
     bool SetInputModeCompartments(bool chinese);
@@ -919,8 +917,38 @@ private:
     static std::string KeyName(WPARAM vk);
     int Modifiers() const;
 
+    void AdviseConversionCompartmentSink() {
+        if (!threadMgr_) return;
+        ITfCompartmentMgr* mgr = nullptr;
+        if (SUCCEEDED(threadMgr_->QueryInterface(IID_ITfCompartmentMgr, reinterpret_cast<void**>(&mgr))) && mgr) {
+            if (SUCCEEDED(mgr->GetCompartment(GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, &conversionCompartment_)) && conversionCompartment_) {
+                ITfSource* source = nullptr;
+                if (SUCCEEDED(conversionCompartment_->QueryInterface(IID_ITfSource, reinterpret_cast<void**>(&source))) && source) {
+                    source->AdviseSink(IID_ITfCompartmentEventSink, static_cast<ITfCompartmentEventSink*>(this), &conversionSinkCookie_);
+                    source->Release();
+                }
+            }
+            mgr->Release();
+        }
+    }
+
+    void UnadviseConversionCompartmentSink() {
+        if (conversionCompartment_) {
+            if (conversionSinkCookie_ != TF_INVALID_COOKIE) {
+                ITfSource* source = nullptr;
+                if (SUCCEEDED(conversionCompartment_->QueryInterface(IID_ITfSource, reinterpret_cast<void**>(&source))) && source) {
+                    source->UnadviseSink(conversionSinkCookie_);
+                    source->Release();
+                }
+                conversionSinkCookie_ = TF_INVALID_COOKIE;
+            }
+            conversionCompartment_->Release();
+            conversionCompartment_ = nullptr;
+        }
+    }
+
     bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
-                  std::string& response);
+                  std::string& response, int explicitModifiers = -1);
     bool ApplyInputMode(const std::string& response);
     bool ApplyResponse(ITfContext* context, const std::string& response);
     bool UpdateCandidates(ITfContext* context, const std::string& response, RECT caret);
@@ -932,18 +960,17 @@ private:
     TfClientId clientId_;
     bool keySinkAdvised_;
     unsigned int nextRequestId_;
-    // Identifies this text service across the shared Host connection.
     unsigned long long sessionId_;
-    // Serialize key callbacks so request IDs and pipe responses cannot race.
     std::mutex callCoreMutex_;
     PipeBridge pipe_;
     ITfContext* compositionContext_;
-    // Set by ActivateEx so a regression in either activation path is visible in
-    // the log instead of showing up as an unexplained missing key sink.
     DWORD activateFlags_;
     bool activatedViaEx_;
     ITfLangBarItemMgr* langBarMgr_;
     ModeLangBarItem* langBarItem_;
+    ITfCompartment* conversionCompartment_;
+    DWORD conversionSinkCookie_;
+    bool updatingCompartment_;
     bool currentModeIsChinese_ = true;
     std::string lastCandidateResponse_;
     int caretRetriesLeft_ = 0;
@@ -1006,10 +1033,6 @@ HRESULT KeyEventSink::OnSetFocus(BOOL foreground) {
     LogForegroundContext("OnSetFocus", nullptr);
     NativeLog::Write("OnSetFocus service=%p foreground=%d", service_, foreground ? 1 : 0);
     service_->LogActiveProfile(foreground ? "OnSetFocus-foreground" : "OnSetFocus-background");
-    // The Host draws the list on a topmost window of its own, so it does not
-    // follow the caret: TSF reports the focus move here and the list has to go
-    // while another application owns the text. Coming back re-shows it while
-    // the composition this service is still holding is alive.
     if (foreground) {
         service_->RefreshInputModeCompartments();
         service_->ShowCandidatesForComposition();
@@ -1037,8 +1060,6 @@ std::string TextService::KeyName(WPARAM vk) {
     case VK_ESCAPE: return "Escape";
     case VK_RETURN: return "Enter";
     case VK_SPACE: return " ";
-    // Keep the lock key identifiable in diagnostics while leaving it
-    // unconsumed so Windows can toggle Caps Lock for the focused application.
     case VK_CAPITAL: return "CapsLock";
     case VK_OEM_MINUS: return "-";
     case VK_OEM_PLUS: return "=";
@@ -1080,11 +1101,9 @@ void TextService::LogActiveProfile(const char* where) const {
     }
     profileMgr->Release();
 }
+
 int TextService::Modifiers() const {
     if (modifierOverrideForTest_ >= 0) return modifierOverrideForTest_;
-    // TSF may invoke the key sink on a thread whose queued-key state does not
-    // reliably reflect the modifier held by the user. Prefer either view of
-    // the state so Shift+Space is not forwarded as a plain Space key.
     const auto isDown = [](int vk) {
         return (GetKeyState(vk) & 0x8000) != 0 || (GetAsyncKeyState(vk) & 0x8000) != 0;
     };
@@ -1097,12 +1116,10 @@ int TextService::Modifiers() const {
 }
 
 bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
-                           std::string& response) {
+                           std::string& response, int explicitModifiers) {
     std::lock_guard<std::mutex> callLock(callCoreMutex_);
     consume = false;
     const std::string key = KeyName(vk);
-    // Forward unknown keys too: Node.js owns key behavior and can interpret
-    // the virtual-key code even when this native adapter has no display name.
 
     if (!pipe_.IsConnected() && !pipe_.ConnectToServer(g_servicePipeName, 50)) {
         NativeLog::Write("CallCore type=%s key=%s pipe unavailable", type.c_str(), key.c_str());
@@ -1111,8 +1128,7 @@ bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bo
 
     const unsigned int id = nextRequestId_++;
     const unsigned int scanCode = (static_cast<unsigned int>(lParam) >> 16) & 0xff;
-    // Snapshot once so the JSON sent to Node and the diagnostic log cannot disagree.
-    const int modifiers = Modifiers();
+    const int modifiers = (explicitModifiers >= 0) ? explicitModifiers : Modifiers();
     const std::string request =
         std::string("{\"id\":") + std::to_string(id) +
         ",\"session\":" + std::to_string(sessionId_) +
@@ -1141,8 +1157,6 @@ bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bo
         return false;
     }
     consume = JsonBool(response, "consume", false);
-    // Log receipt of the Node reply and its mode field without logging the full
-    // payload (which may contain user composition text).
     const std::string responseMode = JsonString(response, "mode");
     NativeLog::Write("CallCore NODE_REPLY_RECEIVED id=%u consume=%d bytes=%zu mode='%s'",
         id, consume ? 1 : 0, response.size(), responseMode.empty() ? "<missing>" : responseMode.c_str());
@@ -1151,13 +1165,11 @@ bool TextService::CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bo
 
 bool TextService::TestKey(ITfContext* context, WPARAM wParam, LPARAM lParam, bool& consume) {
     (void)context;
-    // Forward modifier state to TypeScript; the core owns shortcut policy.
     std::string response;
     return CallCore("testKeyDown", wParam, lParam, consume, response);
 }
 
 bool TextService::HandleKey(ITfContext* context, WPARAM wParam, LPARAM lParam, bool& consume) {
-    // Shortcut consumption is decided by TypeScript using the forwarded modifiers.
     std::string response;
     if (!CallCore("keyDown", wParam, lParam, consume, response)) return false;
     if (!ApplyInputMode(response)) NativeLog::Write("HandleKey failed to mirror Node input mode");
@@ -1178,12 +1190,24 @@ HRESULT STDMETHODCALLTYPE ModeLangBarItem::OnClick(TfLBIClick click, POINT pt, c
 void TextService::ToggleMode() {
     NativeLog::Write("TextService::ToggleMode enter");
     bool consume = false;
-    HandleKey(nullptr, VK_SHIFT, 0, consume);
+    std::string response;
+    // Try explicit toggleMode message first; fall back to synthesized VK_SHIFT with Shift modifier=1
+    if (CallCore("toggleMode", VK_SHIFT, 0, consume, response, 1)) {
+        const std::string mode = JsonString(response, "mode");
+        if (mode == "chinese" || mode == "english") {
+            ApplyInputMode(response);
+            return;
+        }
+    }
+    if (CallCore("keyDown", VK_SHIFT, 0, consume, response, 1)) {
+        ApplyInputMode(response);
+    }
 }
 
 bool TextService::SetInputModeCompartments(bool chinese) {
     if (!threadMgr_) return false;
     bool conversionUpdated = false;
+    updatingCompartment_ = true;
 
     auto setCompartment = [this, chinese, &conversionUpdated](ITfCompartmentMgr* mgr, const char* scope) {
         if (!mgr) return;
@@ -1218,14 +1242,13 @@ bool TextService::SetInputModeCompartments(bool chinese) {
         }
     };
 
-    // Keep conversion mode scoped to this TSF thread; avoid changing global state.
     ITfCompartmentMgr* threadCompartments = nullptr;
     HRESULT hr = threadMgr_->QueryInterface(IID_ITfCompartmentMgr, reinterpret_cast<void**>(&threadCompartments));
     if (SUCCEEDED(hr) && threadCompartments) {
         setCompartment(threadCompartments, "thread");
         threadCompartments->Release();
-
     }
+    updatingCompartment_ = false;
     return conversionUpdated;
 }
 
@@ -1272,7 +1295,7 @@ bool TextService::ApplyResponse(ITfContext* context, const std::string& response
     for (size_t i = 0; i < candidates.size(); ++i) {
         NativeLog::Write("ApplyResponse candidate[%zu]=%s", i, candidates[i].c_str());
     }
-if (!context) return false;
+    if (!context) return false;
     CompositionEditSession session(this, context, composition_, text, hasCommit);
     HRESULT sessionResult = E_FAIL;
     const HRESULT requestResult = context->RequestEditSession(
@@ -1280,23 +1303,19 @@ if (!context) return false;
     NativeLog::Write("ApplyResponse RequestEditSession request=0x%08lX session=0x%08lX",
         static_cast<unsigned long>(requestResult), static_cast<unsigned long>(sessionResult));
     if (FAILED(requestResult) || FAILED(sessionResult)) {
-        // A rejected edit session must not stay broken: drop the composition so
-        // the next keystroke starts a fresh one instead of failing forever.
         NativeLog::Write("ApplyResponse edit session rejected; dropping composition state");
         if (composition_) {
             composition_->Release();
             composition_ = nullptr;
         }
         compositionContext_ = nullptr;
-        
         HideCandidates();
         return false;
     }
 
-if (hasCommit || composition.empty()) {
+    if (hasCommit || composition.empty()) {
         HideCandidates();
         compositionContext_ = nullptr;
-        
         if (composition_) {
             composition_->Release();
             composition_ = nullptr;
@@ -1314,8 +1333,6 @@ bool TextService::UpdateCandidates(ITfContext* context, const std::string& respo
     LogForegroundContext("UpdateCandidates", context);
     const std::vector<std::string> candidates = JsonCandidateTexts(response);
     const UINT selection = JsonUInt(response, "selectedCandidate", 0);
-    // Keep the last known anchor: an application can report no layout right
-    // after the composition text changed, and the window must stay where it was.
     if (caret.right > caret.left || caret.bottom > caret.top) {
         lastCaretRect_ = caret;
     } else {
@@ -1335,7 +1352,7 @@ bool TextService::UpdateCandidates(ITfContext* context, const std::string& respo
         HideCandidates();
         return true;
     }
-        std::lock_guard<std::mutex> callLock(callCoreMutex_);
+    std::lock_guard<std::mutex> callLock(callCoreMutex_);
     if (!pipe_.IsConnected() && !pipe_.ConnectToServer(g_servicePipeName, 50)) return false;
     const unsigned int id = nextRequestId_++;
     const HWND foreground = GetForegroundWindow();
@@ -1366,10 +1383,6 @@ void TextService::HideCandidates() {
 
 void TextService::ShowCandidatesForComposition() {
     if (!composition_ || !compositionContext_) return;
-    // Re-shows the list the composition is still composing. The anchor is the
-    // caret the last keystroke measured; an empty one is re-probed by the caret
-    // retry timer. UpdateCandidates takes callCoreMutex_ itself and hides again
-    // when the reply it remembers carries no candidates.
     NativeLog::Write("ShowCandidatesForComposition replyBytes=%zu",
         lastCandidateResponse_.size());
     UpdateCandidates(compositionContext_, lastCandidateResponse_, lastCaretRect_);
@@ -1381,7 +1394,6 @@ void TextService::OnCompositionTerminated() {
         composition_ = nullptr;
     }
     compositionContext_ = nullptr;
-    
     HideCandidates();
 }
 
@@ -1405,9 +1417,6 @@ bool ReadCaretRectFromService(RECT& caret) {
 }
 
 HRESULT CompositionSink::OnCompositionTerminated(TfEditCookie, ITfComposition*) {
-    // The application ended the composition on its own. Keeping the stale
-    // ITfComposition makes every later edit session fail, so the service drops
-    // it here instead of waiting for the next commit.
     NativeLog::Write("CompositionSink::OnCompositionTerminated service=%p", service_);
     if (service_) service_->OnCompositionTerminated();
     return S_OK;
@@ -1416,7 +1425,6 @@ HRESULT CompositionSink::OnCompositionTerminated(TfEditCookie, ITfComposition*) 
 HRESULT KeyEventSink::OnTestKeyDown(ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
     LogForegroundContext("OnTestKeyDown", context);
     if (!eaten) return E_POINTER;
-    // Capture modifier state at callback entry; TSF dispatch timing can differ from physical key state.
     const SHORT ctrl = GetKeyState(VK_CONTROL);
     const SHORT asyncCtrl = GetAsyncKeyState(VK_CONTROL);
     const SHORT leftCtrl = GetKeyState(VK_LCONTROL);
@@ -1447,7 +1455,6 @@ HRESULT KeyEventSink::OnTestKeyUp(ITfContext*, WPARAM, LPARAM, BOOL* eaten) {
 HRESULT KeyEventSink::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
     LogForegroundContext("OnKeyDown", context);
     if (!eaten) return E_POINTER;
-    // Capture modifier state at callback entry for comparison with test-key dispatch.
     const SHORT ctrl = GetKeyState(VK_CONTROL);
     const SHORT asyncCtrl = GetAsyncKeyState(VK_CONTROL);
     const SHORT leftCtrl = GetKeyState(VK_LCONTROL);
@@ -1526,12 +1533,6 @@ HRESULT CreateProfiles(ITfInputProcessorProfiles** profiles) {
     return hr;
 }
 
-// Every category this TIP registers. GUID_TFCAT_TIP_KEYBOARD makes it a keyboard
-// TIP at all; the TIPCAP categories are the capability declarations a host reads
-// before offering the TIP to the user. Classic Win32 hosts like Notepad only
-// need the keyboard category, but packaged/immersive hosts (Windows Terminal,
-// Store apps) and the Win+Space switcher skip a keyboard TIP that does not
-// declare these capabilities, which is why switching worked in Notepad only.
 const GUID kTipCategories[] = {
     GUID_TFCAT_TIP_KEYBOARD,
     GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
@@ -1550,7 +1551,6 @@ HRESULT RegisterTipProfile() {
     hr = profiles->Register(CLSID_TypeScriptWindowsIme);
     NativeLog::Hr("ITfInputProcessorProfiles::Register", hr);
     if (SUCCEEDED(hr)) {
-        // Remove legacy profiles from earlier builds; this TIP is zh-CN only.
         profiles->RemoveLanguageProfile(CLSID_TypeScriptWindowsIme, 0x0409, GUID_TypeScriptWindowsImeProfile);
         profiles->RemoveLanguageProfile(CLSID_TypeScriptWindowsIme, 0x0411, GUID_TypeScriptWindowsImeProfile);
         constexpr LANGID langid = 0x0804; // Simplified Chinese (zh-CN)
@@ -1583,10 +1583,6 @@ HRESULT RegisterTipProfile() {
 
 HRESULT UnregisterTipProfile() {
     NativeLog::Write("UnregisterTipProfile begin");
-    // Category metadata is separate from the profile registration, so each
-    // category this TIP registered is removed explicitly. An already absent
-    // category is not an uninstall failure; only the profile Unregister result
-    // decides the outcome.
     ITfCategoryMgr* categoryMgr = nullptr;
     HRESULT categoryResult = CoCreateInstance(CLSID_TF_CategoryMgr, nullptr,
         CLSCTX_INPROC_SERVER, IID_ITfCategoryMgr,
