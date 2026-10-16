@@ -86,9 +86,9 @@ try {
     # Backspace/Delete forwarding and consumption can be checked without TSF,
     # an application, or a running Host. TsIme.cpp is compiled into the test
     # to reach the key sink, which is why it links like the DLL.
-    cl.exe /nologo /std:c++17 /EHsc /W4 KeyHandlingMockTest.cpp "$out\PipeBridge.obj" /Fe:"$out\KeyHandlingMockTest.exe" /link user32.lib advapi32.lib ole32.lib oleaut32.lib gdi32.lib
+    cl.exe /nologo /std:c++17 /EHsc /W4 /utf-8 KeyHandlingMockTest.cpp "$out\PipeBridge.obj" /Fe:"$out\KeyHandlingMockTest.exe" /link user32.lib advapi32.lib ole32.lib oleaut32.lib gdi32.lib
     if ($LASTEXITCODE -ne 0) { throw "KeyHandlingMockTest.exe failed to build." }
-    cl.exe /nologo /std:c++17 /EHsc /W4 TsfDiagnose.cpp /Fe:"$out\TsfDiagnose.exe" ole32.lib advapi32.lib
+    cl.exe /nologo /std:c++17 /EHsc /W4 /utf-8 TsfDiagnose.cpp /Fe:"$out\TsfDiagnose.exe" ole32.lib advapi32.lib
     # Standalone harness for the candidate window: drives CandidateWindow directly
     # and verifies the painted result against a desktop capture, so the window
     # can be debugged without TSF, an application, or the pipe host. It links
@@ -131,7 +131,7 @@ try {
     $stagedExp = Join-Path $staging "TypeScriptWindowsIme.exp"
 
     Remove-Item $stagedDll, $stagedLib, $stagedExp -Force -ErrorAction SilentlyContinue
-    cl.exe /nologo /std:c++17 /EHsc /W4 /LD TsIme.cpp "$out\PipeBridge.obj" /link /OUT:"$stagedDll" /IMPLIB:"$stagedLib" /DEF:"TsIme.def" /SUBSYSTEM:WINDOWS advapi32.lib ole32.lib oleaut32.lib user32.lib gdi32.lib
+    cl.exe /nologo /std:c++17 /EHsc /W4 /utf-8 /LD TsIme.cpp "$out\PipeBridge.obj" /link /OUT:"$stagedDll" /IMPLIB:"$stagedLib" /DEF:"TsIme.def" /SUBSYSTEM:WINDOWS advapi32.lib ole32.lib oleaut32.lib user32.lib gdi32.lib
     if ($LASTEXITCODE -ne 0) { throw "Failed to link TypeScriptWindowsIme.dll." }
 
     if (Test-Path $dll) {

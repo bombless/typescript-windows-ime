@@ -294,13 +294,11 @@ int main() {
             "Ctrl+Space key-down must serialize the Ctrl modifier") && ok;
         service.SetModifierOverrideForTest(-1);
 
-        // Keys the sink cannot name are neither swallowed nor forwarded. VK_HOME
-        // stays outside TextService::KeyName, unlike the F-keys, whose vk values
-        // overlap the lowercase letter range.
-        const size_t requestsBeforeUnmappedKey = core.KeyRequestCount();
-        ok = Expect(!keyDown(VK_HOME), "a key without a name must reach the application") && ok;
-        ok = Expect(core.KeyRequestCount() == requestsBeforeUnmappedKey,
-            "a key without a name must not be sent to the core") && ok;
+        // Keys without a display name are forwarded so TypeScript can interpret
+        // their virtual-key code, but unconsumed keys still reach the application.
+        ok = Expect(!keyDown(VK_HOME), "an unhandled key must reach the application") && ok;
+        ok = Expect(core.LastKeyRequest().find("\"vk\":36") != std::string::npos,
+            "VK_HOME must be forwarded with vk 36") && ok;
     }
 
     // Adapter contract: XAML/WinUI hosts only ask for IID_ITfTextInputProcessorEx.

@@ -51,10 +51,69 @@ class TextService;
 
 // TSF language-bar item: Node's mode response drives the visible CN/EN label.
 DEFINE_GUID(GUID_TsImeLangBarItem, 0x4f77a7b1, 0x2d31, 0x4c62, 0x91, 0x42, 0x38, 0x1b, 0x9e, 0x50, 0x7c, 0x11);
+
+HICON CreateLangBarModeIcon(bool chinese) {
+    const int cx = GetSystemMetrics(SM_CXSMICON);
+    const int cy = GetSystemMetrics(SM_CYSMICON);
+    const int size = (cx > 0 && cy > 0) ? (cx < cy ? cx : cy) : 16;
+    HDC screen = GetDC(nullptr);
+    if (!screen) {
+        NativeLog::Write("ModeLangBarItem CreateIcon GetDC failed error=%lu", GetLastError());
+        return nullptr;
+    }
+    HDC memory = CreateCompatibleDC(screen);
+    HBITMAP color = CreateCompatibleBitmap(screen, size, size);
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
+    if (!memory || !color || !mask) {
+        const DWORD error = GetLastError();
+        NativeLog::Write("ModeLangBarItem CreateIcon GDI allocation failed memory=%p color=%p mask=%p error=%lu",
+            memory, color, mask, error);
+        if (mask) DeleteObject(mask);
+        if (color) DeleteObject(color);
+        if (memory) DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+        return nullptr;
+    }
+    HGDIOBJ old = SelectObject(memory, color);
+    RECT bounds{0, 0, size, size};
+    HBRUSH background = CreateSolidBrush(chinese ? RGB(190, 45, 45) : RGB(35, 105, 190));
+    FillRect(memory, &bounds, background);
+    DeleteObject(background);
+    SetBkMode(memory, TRANSPARENT);
+    SetTextColor(memory, RGB(255, 255, 255));
+    const int fontHeight = -MulDiv(size, 72, 100);
+    HFONT font = CreateFontW(fontHeight, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+    HGDIOBJ oldFont = SelectObject(memory, font);
+    DrawTextW(memory, chinese ? L"中" : L"英", -1, &bounds,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(memory, oldFont);
+    SelectObject(memory, old);
+    DeleteObject(font);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
+
+    ICONINFO info{};
+    info.fIcon = TRUE;
+    info.hbmColor = color;
+    info.hbmMask = mask;
+    HICON icon = CreateIconIndirect(&info);
+    if (!icon) {
+        NativeLog::Write("ModeLangBarItem CreateIconIndirect failed mode=%s error=%lu",
+            chinese ? "chinese" : "english", GetLastError());
+    }
+    DeleteObject(color);
+    DeleteObject(mask);
+    return icon;
+}
+
 class ModeLangBarItem final : public ITfLangBarItemButton, public ITfSource {
 public:
-    ModeLangBarItem() : refs_(1), chinese_(true), sink_(nullptr), cookie_(0) {}
+    explicit ModeLangBarItem(TextService* service = nullptr)
+        : refs_(1), chinese_(true), sink_(nullptr), cookie_(0), service_(service) {}
     ~ModeLangBarItem() { if (sink_) sink_->Release(); }
+    void ClearService() { service_ = nullptr; }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
         if (!out) return E_POINTER; *out = nullptr;
         if (iid == IID_IUnknown || iid == IID_ITfLangBarItem || iid == IID_ITfLangBarItemButton) *out = static_cast<ITfLangBarItemButton*>(this);
@@ -63,7 +122,12 @@ public:
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
     ULONG STDMETHODCALLTYPE Release() override { ULONG n=static_cast<ULONG>(InterlockedDecrement(&refs_)); if (!n) delete this; return n; }
-    void SetMode(bool chinese) { if (chinese_ != chinese) { chinese_=chinese; if (sink_) sink_->OnUpdate(TF_LBI_TEXT); } }
+    void SetMode(bool chinese) {
+        if (chinese_ != chinese) {
+            chinese_ = chinese;
+            if (sink_) sink_->OnUpdate(TF_LBI_ICON | TF_LBI_TEXT | TF_LBI_TOOLTIP | TF_LBI_STATUS);
+        }
+    }
     HRESULT STDMETHODCALLTYPE GetInfo(TF_LANGBARITEMINFO* i) override {
         if (!i) return E_POINTER; ZeroMemory(i,sizeof(*i)); i->clsidService=CLSID_TypeScriptWindowsIme;
         i->guidItem=GUID_TsImeLangBarItem; i->dwStyle=TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_BTN_TOGGLE | TF_LBI_STYLE_SHOWNINTRAY;
@@ -71,11 +135,19 @@ public:
     }
     HRESULT STDMETHODCALLTYPE GetStatus(DWORD* s) override { if(!s)return E_POINTER; *s=0; return S_OK; }
     HRESULT STDMETHODCALLTYPE Show(BOOL) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetTooltipString(BSTR* s) override { if(!s)return E_POINTER; *s=SysAllocString(chinese_?L"TypeScript IME - Chinese":L"TypeScript IME - English"); return *s?S_OK:E_OUTOFMEMORY; }
-    HRESULT STDMETHODCALLTYPE OnClick(TfLBIClick,POINT,const RECT*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetTooltipString(BSTR* s) override {
+        if(!s)return E_POINTER;
+        *s=SysAllocString(chinese_?L"TypeScript Windows IME - 中文":L"TypeScript Windows IME - 英文");
+        return *s?S_OK:E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE OnClick(TfLBIClick click, POINT pt, const RECT* prcArea) override;
     HRESULT STDMETHODCALLTYPE InitMenu(ITfMenu*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE OnMenuSelect(UINT) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetIcon(HICON* i) override { if(!i)return E_POINTER; *i=nullptr; return S_FALSE; }
+    HRESULT STDMETHODCALLTYPE GetIcon(HICON* i) override {
+        if(!i)return E_POINTER;
+        *i = CreateLangBarModeIcon(chinese_);
+        return *i ? S_OK : E_FAIL;
+    }
     HRESULT STDMETHODCALLTYPE GetText(BSTR* s) override { if(!s)return E_POINTER; *s=SysAllocString(chinese_?L"\u4E2D":L"\u82F1"); return *s?S_OK:E_OUTOFMEMORY; }
     HRESULT STDMETHODCALLTYPE AdviseSink(REFIID iid,IUnknown* punk,DWORD* cookie) override {
         if(!punk||!cookie)return E_POINTER; if(iid!=IID_ITfLangBarItemSink)return E_NOINTERFACE;
@@ -85,6 +157,7 @@ public:
     HRESULT STDMETHODCALLTYPE UnadviseSink(DWORD cookie) override { if(!sink_||cookie!=cookie_)return E_INVALIDARG; sink_->Release();sink_=nullptr;cookie_=0;return S_OK; }
 private:
     LONG refs_; bool chinese_; ITfLangBarItemSink* sink_; DWORD cookie_;
+    TextService* service_;
 };
 class TextService;
 
@@ -726,7 +799,7 @@ const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
         NativeLog::Write("TextService::Activate pipe connect=%d", pipeConnected ? 1 : 0);
         HRESULT langHr = threadMgr_->QueryInterface(IID_ITfLangBarItemMgr, reinterpret_cast<void**>(&langBarMgr_));
         if (SUCCEEDED(langHr) && langBarMgr_) {
-            langBarItem_ = new (std::nothrow) ModeLangBarItem();
+            langBarItem_ = new (std::nothrow) ModeLangBarItem(this);
             if (langBarItem_) {
                 langHr = langBarMgr_->AddItem(static_cast<ITfLangBarItemButton*>(langBarItem_));
                 if (FAILED(langHr)) { langBarItem_->Release(); langBarItem_ = nullptr; }
@@ -734,6 +807,9 @@ const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
         }
         NativeLog::Write("TextService::Activate language-bar registration hr=0x%08lX item=%p",
             static_cast<unsigned long>(langHr), langBarItem_);
+        currentModeIsChinese_ = true;
+        SetInputModeCompartments(true);
+        if (langBarItem_) langBarItem_->SetMode(true);
         g_activeService = this;
         CreateCaretRetryWindow();
         NativeLog::Write("TextService::Activate success this=%p", this);
@@ -779,7 +855,7 @@ const bool pipeConnected = pipe_.ConnectToServer(g_servicePipeName, 250);
             keyMgr_ = nullptr;
         }
         if (langBarMgr_ && langBarItem_) langBarMgr_->RemoveItem(static_cast<ITfLangBarItemButton*>(langBarItem_));
-        if (langBarItem_) { langBarItem_->Release(); langBarItem_ = nullptr; }
+        if (langBarItem_) { langBarItem_->ClearService(); langBarItem_->Release(); langBarItem_ = nullptr; }
         if (langBarMgr_) { langBarMgr_->Release(); langBarMgr_ = nullptr; }
         if (threadMgr_) {
             threadMgr_->Release();
@@ -829,12 +905,15 @@ bool TestKey(ITfContext*, WPARAM wParam, LPARAM, bool& consume);
     static std::string DiagnosticKeyName(WPARAM vk) { return KeyName(vk); }
     // Deterministic modifier injection for the native mock test; disabled by default.
     void SetModifierOverrideForTest(int modifiers) { modifierOverrideForTest_ = modifiers; }
+    void ToggleMode();
+    bool SetInputModeCompartments(bool chinese);
+    void RefreshInputModeCompartments();
 
 private:
     static std::string KeyName(WPARAM vk);
     int Modifiers() const;
 
-bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
+    bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
                   std::string& response);
     bool ApplyInputMode(const std::string& response);
     bool ApplyResponse(ITfContext* context, const std::string& response);
@@ -859,6 +938,7 @@ bool CallCore(const std::string& type, WPARAM vk, LPARAM lParam, bool& consume,
     bool activatedViaEx_;
     ITfLangBarItemMgr* langBarMgr_;
     ModeLangBarItem* langBarItem_;
+    bool currentModeIsChinese_ = true;
     std::string lastCandidateResponse_;
     int caretRetriesLeft_ = 0;
     int modifierOverrideForTest_ = -1;
@@ -924,8 +1004,12 @@ HRESULT KeyEventSink::OnSetFocus(BOOL foreground) {
     // follow the caret: TSF reports the focus move here and the list has to go
     // while another application owns the text. Coming back re-shows it while
     // the composition this service is still holding is alive.
-    if (foreground) service_->ShowCandidatesForComposition();
-    else service_->HideCandidates();
+    if (foreground) {
+        service_->RefreshInputModeCompartments();
+        service_->ShowCandidatesForComposition();
+    } else {
+        service_->HideCandidates();
+    }
     return S_OK;
 }
 
@@ -1075,6 +1159,82 @@ bool TextService::HandleKey(ITfContext* context, WPARAM wParam, LPARAM lParam, b
     return true;
 }
 
+HRESULT STDMETHODCALLTYPE ModeLangBarItem::OnClick(TfLBIClick click, POINT pt, const RECT* prcArea) {
+    (void)pt;
+    (void)prcArea;
+    NativeLog::Write("ModeLangBarItem::OnClick click=%d service=%p", click, service_);
+    if (click == TF_LBI_CLK_LEFT && service_) {
+        service_->ToggleMode();
+    }
+    return S_OK;
+}
+
+void TextService::ToggleMode() {
+    NativeLog::Write("TextService::ToggleMode enter");
+    bool consume = false;
+    HandleKey(nullptr, VK_SHIFT, 0, consume);
+}
+
+bool TextService::SetInputModeCompartments(bool chinese) {
+    if (!threadMgr_) return false;
+    bool anySucceeded = false;
+
+    auto setCompartment = [this, chinese](ITfCompartmentMgr* mgr, const char* scope) {
+        if (!mgr) return;
+        ITfCompartment* conversion = nullptr;
+        HRESULT hr = mgr->GetCompartment(GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, &conversion);
+        if (SUCCEEDED(hr) && conversion) {
+            VARIANT value;
+            VariantInit(&value);
+            value.vt = VT_I4;
+            value.lVal = chinese ? TF_CONVERSIONMODE_NATIVE : TF_CONVERSIONMODE_ALPHANUMERIC;
+            hr = conversion->SetValue(clientId_, &value);
+            NativeLog::Write("SetInputModeCompartments scope=%s conversion mode=%s val=0x%08lX hr=0x%08lX",
+                scope, chinese ? "chinese" : "english", static_cast<unsigned long>(value.lVal), static_cast<unsigned long>(hr));
+            conversion->Release();
+        } else {
+            NativeLog::Write("SetInputModeCompartments scope=%s GetCompartment(CONVERSION) hr=0x%08lX",
+                scope, static_cast<unsigned long>(hr));
+        }
+
+        ITfCompartment* openclose = nullptr;
+        hr = mgr->GetCompartment(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, &openclose);
+        if (SUCCEEDED(hr) && openclose) {
+            VARIANT value;
+            VariantInit(&value);
+            value.vt = VT_I4;
+            value.lVal = 1;
+            hr = openclose->SetValue(clientId_, &value);
+            NativeLog::Write("SetInputModeCompartments scope=%s openclose hr=0x%08lX",
+                scope, static_cast<unsigned long>(hr));
+            openclose->Release();
+        }
+    };
+
+    ITfCompartmentMgr* threadCompartments = nullptr;
+    HRESULT hr = threadMgr_->QueryInterface(IID_ITfCompartmentMgr, reinterpret_cast<void**>(&threadCompartments));
+    if (SUCCEEDED(hr) && threadCompartments) {
+        setCompartment(threadCompartments, "thread");
+        threadCompartments->Release();
+        anySucceeded = true;
+    }
+
+    ITfCompartmentMgr* globalCompartments = nullptr;
+    hr = threadMgr_->GetGlobalCompartment(&globalCompartments);
+    if (SUCCEEDED(hr) && globalCompartments) {
+        setCompartment(globalCompartments, "global");
+        globalCompartments->Release();
+        anySucceeded = true;
+    }
+
+    return anySucceeded;
+}
+
+void TextService::RefreshInputModeCompartments() {
+    SetInputModeCompartments(currentModeIsChinese_);
+    if (langBarItem_) langBarItem_->SetMode(currentModeIsChinese_);
+}
+
 bool TextService::ApplyInputMode(const std::string& response) {
     const std::string mode = JsonString(response, "mode");
     NativeLog::Write("ApplyInputMode NODE_MODE_PARSED mode='%s' responseBytes=%zu threadMgr=%d",
@@ -1083,42 +1243,20 @@ bool TextService::ApplyInputMode(const std::string& response) {
         NativeLog::Write("ApplyInputMode NODE_MODE_IGNORED reason=missing-or-unsupported-mode");
         return true;
     }
+    const bool isChinese = (mode == "chinese");
+    currentModeIsChinese_ = isChinese;
+    if (langBarItem_) langBarItem_->SetMode(isChinese);
     if (!threadMgr_) {
         NativeLog::Write("ApplyInputMode NODE_MODE_RECEIVED_BUT_NOT_APPLIED reason=no-thread-manager mode=%s", mode.c_str());
         return false;
     }
-    if (langBarItem_) langBarItem_->SetMode(mode == "chinese");
-
-    ITfCompartmentMgr* compartments = nullptr;
-    HRESULT hr = threadMgr_->QueryInterface(IID_ITfCompartmentMgr,
-        reinterpret_cast<void**>(&compartments));
-    if (FAILED(hr) || !compartments) {
-        NativeLog::Write("ApplyInputMode QueryInterface(ITfCompartmentMgr) hr=0x%08lX",
-            static_cast<unsigned long>(hr));
-        return false;
-    }
-    ITfCompartment* conversion = nullptr;
-    hr = compartments->GetCompartment(GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, &conversion);
-    compartments->Release();
-    if (FAILED(hr) || !conversion) {
-        NativeLog::Write("ApplyInputMode GetCompartment hr=0x%08lX", static_cast<unsigned long>(hr));
-        return false;
-    }
-
-    VARIANT value;
-    VariantInit(&value);
-    value.vt = VT_I4;
-    value.lVal = mode == "chinese" ? TF_CONVERSIONMODE_NATIVE : 0;
-    hr = conversion->SetValue(clientId_, &value);
-    conversion->Release();
-    NativeLog::Write("ApplyInputMode mode=%s conversion=0x%08lX hr=0x%08lX",
-        mode.c_str(), static_cast<unsigned long>(value.lVal), static_cast<unsigned long>(hr));
-    if (SUCCEEDED(hr)) {
+    const bool ok = SetInputModeCompartments(isChinese);
+    if (ok) {
         const std::string confirmed = "{\"id\":0,\"session\":" + std::to_string(sessionId_) +
             ",\"type\":\"modeApplied\",\"mode\":\"" + mode + "\"}";
         if (!pipe_.Notify(confirmed)) NativeLog::Write("ApplyInputMode failed to notify Host of confirmed mode=%s", mode.c_str());
     }
-    return SUCCEEDED(hr);
+    return ok;
 }
 
 bool TextService::ApplyResponse(ITfContext* context, const std::string& response) {
@@ -1397,6 +1535,7 @@ HRESULT CreateProfiles(ITfInputProcessorProfiles** profiles) {
 // declare these capabilities, which is why switching worked in Notepad only.
 const GUID kTipCategories[] = {
     GUID_TFCAT_TIP_KEYBOARD,
+    GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
     GUID_TFCAT_TIPCAP_COMLESS,
     GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
     GUID_TFCAT_TIPCAP_SECUREMODE,
