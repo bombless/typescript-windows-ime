@@ -1,5 +1,4 @@
 #include <windows.h>
-#include <shellapi.h>
 #include <aclapi.h>
 #include <sddl.h>
 #include "NativeLog.h"
@@ -20,9 +19,6 @@
 
 namespace {
 constexpr DWORD kBufferSize = 16 * 1024;
-constexpr UINT kTrayMessage = WM_APP + 40;
-constexpr UINT kTrayModeChanged = WM_APP + 41;
-const UINT kTaskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
 #ifdef TSIME_RELEASE
 constexpr wchar_t kNodePipeBase[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Host.Release";
 constexpr wchar_t kTsfPipeBase[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf.Release";
@@ -42,7 +38,6 @@ std::wstring PipeName(const wchar_t* base) {
 }
 
 std::atomic<bool> g_running{true};
-bool g_trayTestMode = false;
 // Opt-in diagnostic mode: keep the last candidate list on screen when TSF
 // deactivates or sends hideCandidates. Never enabled in normal launches.
 bool KeepCandidatesForDebug() {
@@ -57,131 +52,6 @@ std::condition_variable g_clientsChanged;
 // startup ownership check use these.
 std::wstring g_nodePipeName;
 std::wstring g_tsfPipeName;
-std::mutex g_trayMutex;
-std::wstring g_confirmedMode;
-HWND g_trayWindow = nullptr;
-HANDLE g_trayReady = nullptr;
-
-const GUID kTrayGuid = {0x9db42187, 0x25c1, 0x4b41, {0xa2, 0x6e, 0x6c, 0x14, 0x4f, 0x39, 0x51, 0x82}};
-
-HICON CreateModeIcon(bool chinese) {
-    constexpr int size = 32;
-    HDC screen = GetDC(nullptr);
-    if (!screen) { NativeLog::Write("Tray CreateModeIcon GetDC failed error=%lu", GetLastError()); return nullptr; }
-    HDC memory = CreateCompatibleDC(screen);
-    HBITMAP color = CreateCompatibleBitmap(screen, size, size);
-    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
-    if (!memory || !color || !mask) {
-        const DWORD error = GetLastError();
-        NativeLog::Write("Tray CreateModeIcon GDI allocation failed mode=%s memory=%p color=%p mask=%p error=%lu",
-            chinese ? "chinese" : "english", memory, color, mask, error);
-        if (mask) DeleteObject(mask);
-        if (color) DeleteObject(color);
-        if (memory) DeleteDC(memory);
-        ReleaseDC(nullptr, screen);
-        return nullptr;
-    }
-    HGDIOBJ old = SelectObject(memory, color);
-    RECT bounds{0, 0, size, size};
-    HBRUSH background = CreateSolidBrush(chinese ? RGB(190, 45, 45) : RGB(35, 105, 190));
-    FillRect(memory, &bounds, background); DeleteObject(background);
-    SetBkMode(memory, TRANSPARENT); SetTextColor(memory, RGB(255, 255, 255));
-    HFONT font = CreateFontW(-21, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-    HGDIOBJ oldFont = SelectObject(memory, font);
-    DrawTextW(memory, chinese ? L"中" : L"英", -1, &bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    SelectObject(memory, oldFont); SelectObject(memory, old); DeleteObject(font); DeleteDC(memory); ReleaseDC(nullptr, screen);
-    ICONINFO info{}; info.fIcon = TRUE; info.hbmColor = color; info.hbmMask = mask;
-    HICON icon = CreateIconIndirect(&info);
-    if (!icon) NativeLog::Write("Tray CreateIconIndirect failed mode=%s error=%lu", chinese ? "chinese" : "english", GetLastError());
-    else NativeLog::Write("Tray icon created mode=%s handle=%p", chinese ? "chinese" : "english", icon);
-    DeleteObject(color); DeleteObject(mask); return icon;
-}
-
-void RefreshTrayIcon(HWND window, bool add = false) {
-    std::wstring mode; { std::lock_guard<std::mutex> lock(g_trayMutex); mode = g_confirmedMode; }
-    NativeLog::Write("Tray refresh requested hwnd=%p operation=%s mode=%ls", window, add ? "ADD" : "MODIFY", mode.empty() ? L"(unset)" : mode.c_str());
-    if (mode != L"chinese" && mode != L"english") { NativeLog::Write("Tray refresh skipped: no confirmed mode yet"); return; }
-    NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = window; data.uID = 1;
-    data.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_GUID; data.guidItem = kTrayGuid; data.uCallbackMessage = kTrayMessage;
-    data.hIcon = CreateModeIcon(mode == L"chinese");
-    wcscpy_s(data.szTip, mode == L"chinese" ? L"TypeScript Windows IME — 中文模式" : L"TypeScript Windows IME — English mode");
-    if (!data.hIcon) {
-        NativeLog::Write("Tray refresh aborted: CreateModeIcon returned NULL mode=%ls", mode.c_str());
-    } else {
-        bool added = add;
-        BOOL ok = Shell_NotifyIconW(add ? NIM_ADD : NIM_MODIFY, &data);
-        DWORD error = ok ? ERROR_SUCCESS : GetLastError();
-        NativeLog::Write("Tray Shell_NotifyIcon operation=%s result=%d error=%lu hwnd=%p uid=%u guid=%08lx",
-            add ? "NIM_ADD" : "NIM_MODIFY", ok, error, window, data.uID, data.guidItem.Data1);
-        if (!ok && !add) {
-            NativeLog::Write("Tray NIM_MODIFY failed; attempting NIM_ADD");
-            added = true; ok = Shell_NotifyIconW(NIM_ADD, &data); error = ok ? ERROR_SUCCESS : GetLastError();
-            NativeLog::Write("Tray Shell_NotifyIcon operation=NIM_ADD(fallback) result=%d error=%lu", ok, error);
-        }
-        if (ok && added) {
-            data.uVersion = NOTIFYICON_VERSION_4;
-            BOOL versionOk = Shell_NotifyIconW(NIM_SETVERSION, &data);
-            error = versionOk ? ERROR_SUCCESS : GetLastError();
-            NativeLog::Write("Tray Shell_NotifyIcon operation=NIM_SETVERSION result=%d error=%lu", versionOk, error);
-        }
-        DestroyIcon(data.hIcon);
-    }
-}
-
-LRESULT CALLBACK TrayWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (message == kTaskbarCreatedMessage) { NativeLog::Write("Tray received TaskbarCreated hwnd=%p; re-adding icon", window); RefreshTrayIcon(window, true); return 0; }
-    if (message == kTrayModeChanged) { NativeLog::Write("Tray received mode-changed message hwnd=%p", window); RefreshTrayIcon(window); return 0; }
-    if (message == WM_DESTROY) {
-        NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = window; data.uID = 1; data.uFlags = NIF_GUID; data.guidItem = kTrayGuid;
-        BOOL ok = Shell_NotifyIconW(NIM_DELETE, &data); DWORD error = ok ? ERROR_SUCCESS : GetLastError();
-        NativeLog::Write("Tray Shell_NotifyIcon operation=NIM_DELETE result=%d error=%lu hwnd=%p", ok, error, window);
-        PostQuitMessage(0); return 0;
-    }
-    return DefWindowProcW(window, message, wParam, lParam);
-}
-
-void TrayThread() {
-    WNDCLASSW wc{}; wc.lpfnWndProc = TrayWindowProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"TypeScriptWindowsImeTrayWindow";
-    NativeLog::Write("Tray thread starting taskbarCreatedMessage=%u", kTaskbarCreatedMessage);
-    ATOM atom = RegisterClassW(&wc);
-    DWORD registerError = atom ? ERROR_SUCCESS : GetLastError();
-    NativeLog::Write("Tray RegisterClassW result=%u error=%lu class=%ls", atom, registerError, wc.lpszClassName);
-    HWND window = CreateWindowExW(0, wc.lpszClassName, L"TypeScript Windows IME Tray", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
-    DWORD createError = window ? ERROR_SUCCESS : GetLastError();
-    NativeLog::Write("Tray CreateWindowExW result hwnd=%p error=%lu parent=HWND_MESSAGE", window, createError);
-    g_trayWindow = window;
-    if (window && g_trayTestMode) {
-        // Exercise the exact same icon creation and Shell_NotifyIcon path as the
-        // IME, but without waiting for a TSF modeApplied notification.
-        { std::lock_guard<std::mutex> lock(g_trayMutex); g_confirmedMode = L"english"; }
-        NativeLog::Write("Tray test mode: adding standalone English tray icon");
-        RefreshTrayIcon(window, true);
-    }
-    if (g_trayReady) { BOOL signaled = SetEvent(g_trayReady); NativeLog::Write("Tray ready event signaled result=%d error=%lu", signaled, signaled ? ERROR_SUCCESS : GetLastError()); }
-    if (window) {
-        MSG message;
-        for (;;) {
-            BOOL result = GetMessageW(&message, nullptr, 0, 0);
-            if (result <= 0) { NativeLog::Write("Tray GetMessageW ended result=%d error=%lu message=%u", result, result == -1 ? GetLastError() : ERROR_SUCCESS, message.message); break; }
-            TranslateMessage(&message); DispatchMessageW(&message);
-        }
-        DestroyWindow(window);
-    } else NativeLog::Write("Tray thread exiting because message window creation failed");
-    g_trayWindow = nullptr;
-    NativeLog::Write("Tray thread stopped");
-}
-
-void ConfirmTrayMode(const std::string& mode) {
-    if (mode != "chinese" && mode != "english") return;
-    { std::lock_guard<std::mutex> lock(g_trayMutex); g_confirmedMode = mode == "chinese" ? L"chinese" : L"english"; }
-    NativeLog::Write("Tray confirmed mode=%s", mode.c_str());
-    if (g_trayWindow) {
-        BOOL posted = PostMessageW(g_trayWindow, kTrayModeChanged, 0, 0);
-        NativeLog::Write("Tray PostMessage mode-changed result=%d error=%lu hwnd=%p", posted, posted ? ERROR_SUCCESS : GetLastError(), g_trayWindow);
-    } else NativeLog::Write("Tray mode confirmed but tray window is NULL mode=%s", mode.c_str());
-}
-
 // The Node business client. Exactly one may be connected: a newer one replaces
 // the older, which is told to exit by the broken pipe. Node keeps one IME state
 // per session, so a single Node process serves every application.
@@ -535,12 +405,6 @@ void ServeTsfClient(HANDLE pipe) {
         NativeLog::Write("Host TSF request session=%llu type=%s bytes=%zu",
             session, MessageType(line).c_str(), line.size());
         const std::string type = MessageType(line);
-        if (type == "modeApplied") {
-            if (line.find("\"mode\":\"chinese\"") != std::string::npos) ConfirmTrayMode("chinese");
-            else if (line.find("\"mode\":\"english\"") != std::string::npos) ConfirmTrayMode("english");
-            else NativeLog::Write("Tray ignored invalid modeApplied notification session=%llu", session);
-            continue;
-        }
         if (type == "testKeyDown" || type == "keyDown" || type == "keyUp") {
             std::cout << "[HOST KEY][session=" << session << "] type=" << type
                       << " vk=0x" << std::hex << JsonUInt(line, "vk", 0)
@@ -696,58 +560,14 @@ void CancelPendingConnect(PendingConnect* pending) {
 } // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
-    for (int i = 1; i < argc; ++i) {
-        if (_wcsicmp(argv[i], L"/test") == 0 || _wcsicmp(argv[i], L"-test") == 0) {
-            g_trayTestMode = true;
-            break;
-        }
-    }
-
-    NativeLog::Write("Host startup mode=%s", g_trayTestMode ? "tray-test" : "normal");
+    (void)argc; (void)argv;
+    NativeLog::Write("Host startup mode=normal");
     SetConsoleCtrlHandler(HandleConsole, TRUE);
-
-    // Test mode intentionally skips pipe setup/ownership: it must be safe to run
-    // alongside the real Host and only exercises the shared tray implementation.
-    if (g_trayTestMode) {
-        g_trayReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!g_trayReady) {
-            NativeLog::Win32("Tray test CreateEventW");
-            return 1;
-        }
-        std::thread trayThread(TrayThread);
-        const DWORD waitResult = WaitForSingleObject(g_trayReady, 3000);
-        NativeLog::Write("Tray test wait-ready result=%lu hwnd=%p", waitResult, g_trayWindow);
-        if (waitResult != WAIT_OBJECT_0 || !g_trayWindow) {
-            NativeLog::Write("Tray test failed: tray window did not become ready");
-            g_running = false;
-            if (g_trayWindow) PostMessageW(g_trayWindow, WM_CLOSE, 0, 0);
-            if (trayThread.joinable()) trayThread.join();
-            CloseHandle(g_trayReady);
-            g_trayReady = nullptr;
-            return 1;
-        }
-
-        NativeLog::Write("Tray test running; press Ctrl+C or terminate this process to stop");
-        while (g_running) Sleep(200);
-        if (g_trayWindow) PostMessageW(g_trayWindow, WM_CLOSE, 0, 0);
-        if (trayThread.joinable()) trayThread.join();
-        CloseHandle(g_trayReady);
-        g_trayReady = nullptr;
-        NativeLog::Write("Tray test stopped");
-        return 0;
-    }
 
     g_nodePipeName = PipeName(kNodePipeBase);
     g_tsfPipeName = PipeName(kTsfPipeBase);
 
-    g_trayReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    std::thread trayThread(TrayThread);
-    if (g_trayReady) WaitForSingleObject(g_trayReady, 3000);
-
     if (!ClaimExclusiveOwnership()) {
-        if (g_trayWindow) PostMessageW(g_trayWindow, WM_CLOSE, 0, 0);
-        if (trayThread.joinable()) trayThread.join();
-        if (g_trayReady) CloseHandle(g_trayReady);
         return 1;
     }
 
@@ -806,9 +626,6 @@ int wmain(int argc, wchar_t* argv[]) {
     // request any more. Releasing the window here also ends the UI thread's
     // work for this process.
     CandidateWindow::Destroy();
-    if (g_trayWindow) PostMessageW(g_trayWindow, WM_CLOSE, 0, 0);
-    if (trayThread.joinable()) trayThread.join();
-    if (g_trayReady) CloseHandle(g_trayReady);
 
     NativeLog::Write("Host shutdown complete");
     NativeLog::WriteStdout("Host shutdown complete");

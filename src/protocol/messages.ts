@@ -27,6 +27,9 @@ export interface Candidate { text: string; index: number; annotation?: string; }
 export interface ResponseMessage extends SessionScoped {
   id: number; consume: boolean; composition?: string; commit?: string;
   mode?: "chinese" | "english";
+  // Presentation policy is authored by the TypeScript client. Native code only
+  // applies these values through the Windows tray/language-bar APIs.
+  tray?: { visible: boolean; text: string; tooltip: string; background: string; foreground: string };
   candidates?: Candidate[]; selectedCandidate?: number; error?: { code: string; message: string };
 }
 

@@ -54,8 +54,17 @@ void LogTsfViewGeometry(const char* tag, ITfContextView* view) {
 }
 
 class TextService;
+std::wstring Utf8ToWide(const std::string& value);
 
-HICON CreateLangBarModeIcon(bool chinese) {
+COLORREF ParseTrayColor(const std::string& value, COLORREF fallback) {
+    if (value.size() != 7 || value[0] != '#') return fallback;
+    try {
+        const unsigned long rgb = std::stoul(value.substr(1), nullptr, 16);
+        return RGB((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
+    } catch (...) { return fallback; }
+}
+
+HICON CreateLangBarModeIcon(const std::wstring& text, COLORREF backgroundColor, COLORREF foregroundColor) {
     UINT dpi = GetDpiForSystem();
     if (!dpi) dpi = 96;
     const int cx = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
@@ -88,17 +97,17 @@ HICON CreateLangBarModeIcon(bool chinese) {
 
     HGDIOBJ old = SelectObject(memory, color);
     RECT bounds{0, 0, size, size};
-    HBRUSH background = CreateSolidBrush(chinese ? RGB(190, 45, 45) : RGB(35, 105, 190));
+    HBRUSH background = CreateSolidBrush(backgroundColor);
     FillRect(memory, &bounds, background);
     DeleteObject(background);
     SetBkMode(memory, TRANSPARENT);
-    SetTextColor(memory, RGB(255, 255, 255));
+    SetTextColor(memory, foregroundColor);
     const int fontHeight = -MulDiv(size, 72, 100);
     HFONT font = CreateFontW(fontHeight, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
     HGDIOBJ oldFont = SelectObject(memory, font);
-    DrawTextW(memory, chinese ? L"中" : L"英", -1, &bounds,
+    DrawTextW(memory, text.c_str(), -1, &bounds,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(memory, oldFont);
     SelectObject(memory, old);
@@ -113,7 +122,7 @@ HICON CreateLangBarModeIcon(bool chinese) {
     HICON icon = CreateIconIndirect(&info);
     if (!icon) {
         NativeLog::Write("ModeLangBarItem CreateIconIndirect failed mode=%s error=%lu",
-            chinese ? "chinese" : "english", GetLastError());
+            "client-configured", GetLastError());
     }
     DeleteObject(color);
     DeleteObject(mask);
@@ -123,7 +132,8 @@ HICON CreateLangBarModeIcon(bool chinese) {
 class ModeLangBarItem final : public ITfLangBarItemButton, public ITfSource {
 public:
     explicit ModeLangBarItem(TextService* service = nullptr)
-        : refs_(1), chinese_(true), sink_(nullptr), cookie_(0), service_(service) {}
+        : refs_(1), chinese_(true), visible_(false), text_(L"中"), tooltip_(L"TypeScript Windows IME"),
+          background_(RGB(190, 45, 45)), foreground_(RGB(255, 255, 255)), sink_(nullptr), cookie_(0), service_(service) {}
     ~ModeLangBarItem() { if (sink_) sink_->Release(); }
     void ClearService() { service_ = nullptr; }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
@@ -140,13 +150,30 @@ public:
             if (sink_) sink_->OnUpdate(TF_LBI_ICON | TF_LBI_TEXT | TF_LBI_TOOLTIP | TF_LBI_STATUS);
         }
     }
+    bool IsVisible() const { return visible_; }
+    void SetPresentation(bool visible, const std::string& text, const std::string& tooltip,
+                         const std::string& background, const std::string& foreground) {
+        const std::wstring wideText = Utf8ToWide(text);
+        const std::wstring wideTooltip = Utf8ToWide(tooltip);
+        const COLORREF nextBackground = ParseTrayColor(background, background_);
+        const COLORREF nextForeground = ParseTrayColor(foreground, foreground_);
+        const bool changed = visible_ != visible || (!wideText.empty() && text_ != wideText) ||
+            (!wideTooltip.empty() && tooltip_ != wideTooltip) || background_ != nextBackground || foreground_ != nextForeground;
+        if (!changed) return;
+        visible_ = visible;
+        if (!wideText.empty()) text_ = wideText.substr(0, 4);
+        if (!wideTooltip.empty()) tooltip_ = wideTooltip.substr(0, 256);
+        background_ = nextBackground;
+        foreground_ = nextForeground;
+        if (sink_) sink_->OnUpdate(TF_LBI_ICON | TF_LBI_TEXT | TF_LBI_TOOLTIP | TF_LBI_STATUS);
+    }
     HRESULT STDMETHODCALLTYPE GetInfo(TF_LANGBARITEMINFO* i) override {
         if (!i) return E_POINTER;
         ZeroMemory(i, sizeof(*i));
         i->clsidService = CLSID_TypeScriptWindowsIme;
         // Use standard GUID_LBI_INPUTMODE so Windows 10/11 system tray displays the mode indicator.
         i->guidItem = GUID_LBI_INPUTMODE;
-        i->dwStyle = TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_SHOWNINTRAY;
+        i->dwStyle = TF_LBI_STYLE_BTN_BUTTON | (visible_ ? TF_LBI_STYLE_SHOWNINTRAY : 0);
         i->ulSort = 0;
         wcsncpy_s(i->szDescription, L"TypeScript Windows IME mode", _TRUNCATE);
         return S_OK;
@@ -159,7 +186,7 @@ public:
     HRESULT STDMETHODCALLTYPE Show(BOOL) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetTooltipString(BSTR* s) override {
         if (!s) return E_POINTER;
-        *s = SysAllocString(chinese_ ? L"TypeScript Windows IME - 中文" : L"TypeScript Windows IME - 英文");
+        *s = SysAllocString(tooltip_.c_str());
         return *s ? S_OK : E_OUTOFMEMORY;
     }
     HRESULT STDMETHODCALLTYPE OnClick(TfLBIClick click, POINT pt, const RECT* prcArea) override;
@@ -167,12 +194,12 @@ public:
     HRESULT STDMETHODCALLTYPE OnMenuSelect(UINT) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetIcon(HICON* i) override {
         if (!i) return E_POINTER;
-        *i = CreateLangBarModeIcon(chinese_);
+        *i = CreateLangBarModeIcon(text_, background_, foreground_);
         return *i ? S_OK : E_FAIL;
     }
     HRESULT STDMETHODCALLTYPE GetText(BSTR* s) override {
         if (!s) return E_POINTER;
-        *s = SysAllocString(chinese_ ? L"\u4E2D" : L"\u82F1");
+        *s = SysAllocString(text_.c_str());
         return *s ? S_OK : E_OUTOFMEMORY;
     }
     HRESULT STDMETHODCALLTYPE AdviseSink(REFIID iid, IUnknown* punk, DWORD* cookie) override {
@@ -188,7 +215,8 @@ public:
         sink_->Release(); sink_ = nullptr; cookie_ = 0; return S_OK;
     }
 private:
-    LONG refs_; bool chinese_; ITfLangBarItemSink* sink_; DWORD cookie_;
+    LONG refs_; bool chinese_; bool visible_; std::wstring text_; std::wstring tooltip_;
+    COLORREF background_; COLORREF foreground_; ITfLangBarItemSink* sink_; DWORD cookie_;
     TextService* service_;
 };
 
@@ -888,12 +916,6 @@ public:
                 NativeLog::Write("ITfCompartmentEventSink::OnChange external mode change to %s", isChinese ? "chinese" : "english");
                 currentModeIsChinese_ = isChinese;
                 if (langBarItem_) langBarItem_->SetMode(isChinese);
-                std::lock_guard<std::mutex> callLock(callCoreMutex_);
-                if (pipe_.IsConnected() || pipe_.ConnectToServer(g_servicePipeName, 50)) {
-                    const std::string confirmed = "{\"id\":0,\"session\":" + std::to_string(sessionId_) +
-                        ",\"type\":\"modeApplied\",\"mode\":\"" + (isChinese ? "chinese" : "english") + "\"}";
-                    pipe_.Notify(confirmed);
-                }
             }
         }
         VariantClear(&val);
@@ -1262,6 +1284,17 @@ void TextService::RefreshInputModeCompartments() {
 }
 
 bool TextService::ApplyInputMode(const std::string& response) {
+    if (langBarItem_ && response.find("\"tray\":{") != std::string::npos) {
+        const bool visible = JsonBool(response, "visible", false);
+        const bool visibilityChanged = langBarItem_->IsVisible() != visible;
+        if (visibilityChanged && langBarMgr_) langBarMgr_->RemoveItem(static_cast<ITfLangBarItemButton*>(langBarItem_));
+        langBarItem_->SetPresentation(visible, JsonString(response, "text"), JsonString(response, "tooltip"),
+            JsonString(response, "background"), JsonString(response, "foreground"));
+        if (visibilityChanged && langBarMgr_) {
+            const HRESULT trayHr = langBarMgr_->AddItem(static_cast<ITfLangBarItemButton*>(langBarItem_));
+            NativeLog::Write("ApplyInputMode tray visibility=%d re-register hr=0x%08lX", visible ? 1 : 0, static_cast<unsigned long>(trayHr));
+        }
+    }
     const std::string mode = JsonString(response, "mode");
     NativeLog::Write("ApplyInputMode NODE_MODE_PARSED mode='%s' responseBytes=%zu threadMgr=%d",
         mode.empty() ? "<missing>" : mode.c_str(), response.size(), threadMgr_ ? 1 : 0);
@@ -1277,11 +1310,6 @@ bool TextService::ApplyInputMode(const std::string& response) {
         return false;
     }
     const bool ok = SetInputModeCompartments(isChinese);
-    if (ok) {
-        const std::string confirmed = "{\"id\":0,\"session\":" + std::to_string(sessionId_) +
-            ",\"type\":\"modeApplied\",\"mode\":\"" + mode + "\"}";
-        if (!pipe_.Notify(confirmed)) NativeLog::Write("ApplyInputMode failed to notify Host of confirmed mode=%s", mode.c_str());
-    }
     return ok;
 }
 

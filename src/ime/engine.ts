@@ -35,6 +35,13 @@ export class SimpleEngine implements ImeEngine {
       consume: result.consume,
       composition: result.state.composition,
       mode: result.state.mode ?? "chinese",
+      tray: {
+        visible: true,
+        text: (result.state.mode ?? "chinese") === "chinese" ? "中" : "EN",
+        tooltip: (result.state.mode ?? "chinese") === "chinese" ? "TypeScript Windows IME — 中文模式" : "TypeScript Windows IME — English mode",
+        background: (result.state.mode ?? "chinese") === "chinese" ? "#be2d2d" : "#2369be",
+        foreground: "#ffffff",
+      },
       candidates,
       selectedCandidate: result.state.selectedCandidate,
       ...(result.commit !== undefined ? { commit: result.commit } : {}),
