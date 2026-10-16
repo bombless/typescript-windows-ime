@@ -16,7 +16,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $payload 'native\install') 
 # using a versioned DLL, which otherwise silently ships stale candidate-window
 # painting and Host behavior in a newly built MSI.
 $builtDll = Join-Path $root 'native\build\release\TypeScriptWindowsIme.dll'
-$builtHost = Join-Path $root 'native\build\TypeScriptWindowsImeHost.exe'
+$builtHost = Join-Path $root 'native\build\release\TypeScriptWindowsImeHost.exe'
 foreach ($artifact in @($builtDll, $builtHost)) {
     if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
         throw "Current native build artifact is missing: $artifact. Run native\build.ps1 before building the MSI."

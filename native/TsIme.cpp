@@ -194,7 +194,11 @@ private:
 
 volatile LONG g_serverLocks = 0;
 volatile LONG g_objectCount = 0;
-constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf";
+#ifdef TSIME_RELEASE
+constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf.Release";
+#else
+constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf.Dev";
+#endif
 const wchar_t* g_servicePipeName = kPipeName;
 
 TextService* g_activeService = nullptr;

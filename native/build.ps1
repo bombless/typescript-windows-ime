@@ -110,10 +110,12 @@ try {
     # DLL. A running Host keeps its image locked, so replacing the file under
     # native\build would fail with LNK1104. install-host.ps1 copies the staged
     # binary into native\install under a unique name and restarts it.
-    $hostExe = Join-Path $out "TypeScriptWindowsImeHost.exe"
+    $hostExe = if ($Flavor -eq "Release") { Join-Path $out "release\TypeScriptWindowsImeHost.exe" } else { Join-Path $out "TypeScriptWindowsImeHost.exe" }
+    if ($Flavor -eq "Release") { New-Item -ItemType Directory -Force -Path (Split-Path -Parent $hostExe) | Out-Null }
     $stagedHost = Join-Path $staging "TypeScriptWindowsImeHost.exe"
     Remove-Item $stagedHost -Force -ErrorAction SilentlyContinue
-    cl.exe /nologo /std:c++17 /EHsc /W4 /utf-8 TypeScriptWindowsImeHost.cpp "$out\CandidateWindow.obj" /Fe:"$stagedHost" /link user32.lib gdi32.lib advapi32.lib shell32.lib
+    $flavorDefine = if ($Flavor -eq "Release") { "/DTSIME_RELEASE=1" } else { "/DTSIME_DEV=1" }
+    cl.exe /nologo /std:c++17 /EHsc /W4 /utf-8 $flavorDefine TypeScriptWindowsImeHost.cpp "$out\CandidateWindow.obj" /Fe:"$stagedHost" /link user32.lib gdi32.lib advapi32.lib shell32.lib
     if ($LASTEXITCODE -eq 0) {
         try {
             Move-Item $stagedHost $hostExe -Force
@@ -133,7 +135,6 @@ if ($Flavor -eq "Release") { New-Item -ItemType Directory -Force -Path (Split-Pa
     $stagedExp = Join-Path $staging "TypeScriptWindowsIme.exp"
 
     Remove-Item $stagedDll, $stagedLib, $stagedExp -Force -ErrorAction SilentlyContinue
-    $flavorDefine = if ($Flavor -eq "Release") { "/DTSIME_RELEASE=1" } else { "/DTSIME_DEV=1" }
     cl.exe /nologo /std:c++17 /EHsc /W4 /utf-8 $flavorDefine /LD TsIme.cpp "$out\PipeBridge.obj" /link /OUT:"$stagedDll" /IMPLIB:"$stagedLib" /DEF:"TsIme.def" /SUBSYSTEM:WINDOWS advapi32.lib ole32.lib oleaut32.lib user32.lib gdi32.lib
     if ($LASTEXITCODE -ne 0) { throw "Failed to link TypeScriptWindowsIme.dll." }
 

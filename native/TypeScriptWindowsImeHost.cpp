@@ -23,8 +23,13 @@ constexpr DWORD kBufferSize = 16 * 1024;
 constexpr UINT kTrayMessage = WM_APP + 40;
 constexpr UINT kTrayModeChanged = WM_APP + 41;
 const UINT kTaskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
-constexpr wchar_t kNodePipeBase[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Host";
-constexpr wchar_t kTsfPipeBase[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf";
+#ifdef TSIME_RELEASE
+constexpr wchar_t kNodePipeBase[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Host.Release";
+constexpr wchar_t kTsfPipeBase[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf.Release";
+#else
+constexpr wchar_t kNodePipeBase[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Host.Dev";
+constexpr wchar_t kTsfPipeBase[] = L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf.Dev";
+#endif
 
 // Test seam: a pipe suffix puts a second Host on private pipes so a test can
 // drive a Host of its own next to a running one without disturbing either. The

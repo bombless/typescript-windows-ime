@@ -188,8 +188,8 @@ bool Hello(Session& session, int id) {
 
 int wmain() {
     const std::wstring suffix = std::to_wstring(GetCurrentProcessId());
-    const std::wstring tsfPipe = PipePath(L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf", suffix);
-    const std::wstring nodePipe = PipePath(L"\\\\.\\pipe\\TypeScriptWindowsIME.Host", suffix);
+    const std::wstring tsfPipe = PipePath(L"\\\\.\\pipe\\TypeScriptWindowsIME.Tsf.Dev", suffix);
+    const std::wstring nodePipe = PipePath(L"\\\\.\\pipe\\TypeScriptWindowsIME.Host.Dev", suffix);
 
     wchar_t path[MAX_PATH]{};
     GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));

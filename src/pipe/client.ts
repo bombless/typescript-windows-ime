@@ -6,7 +6,11 @@ import { getCandidates } from "../ime/candidates.js";
 import { initialImeState, type ImeState } from "../ime/state.js";
 import { appendFileSync } from "node:fs";
 
-export const PIPE_NAME = "\\\\.\\pipe\\TypeScriptWindowsIME.Host";
+const pipeFlavor = process.env.TSIME_FLAVOR?.toLowerCase() === "release"
+  || (process.env.TSIME_FLAVOR === undefined && process.argv[1]?.replace(/\\/g, "/").includes("/dist/"))
+  ? "Release"
+  : "Dev";
+export const PIPE_NAME = `\\\\.\\pipe\\TypeScriptWindowsIME.Host.${pipeFlavor}`;
 
 function timestamp(): string {
   const now = new Date();
