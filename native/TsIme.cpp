@@ -133,7 +133,13 @@ public:
         i->guidItem=GUID_TsImeLangBarItem; i->dwStyle=TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_BTN_TOGGLE | TF_LBI_STYLE_SHOWNINTRAY;
         i->ulSort=0; wcsncpy_s(i->szDescription,L"TypeScript Windows IME mode",_TRUNCATE); return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE GetStatus(DWORD* s) override { if(!s)return E_POINTER; *s=0; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetStatus(DWORD* s) override {
+        if (!s) return E_POINTER;
+        // This item advertises TF_LBI_STYLE_BTN_TOGGLE, so report the actual
+        // toggle state instead of permanently claiming that it is unchecked.
+        *s = chinese_ ? TF_LBI_STATUS_BTN_TOGGLED : 0;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE Show(BOOL) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetTooltipString(BSTR* s) override {
         if(!s)return E_POINTER;
@@ -1177,9 +1183,9 @@ void TextService::ToggleMode() {
 
 bool TextService::SetInputModeCompartments(bool chinese) {
     if (!threadMgr_) return false;
-    bool anySucceeded = false;
+    bool conversionUpdated = false;
 
-    auto setCompartment = [this, chinese](ITfCompartmentMgr* mgr, const char* scope) {
+    auto setCompartment = [this, chinese, &conversionUpdated](ITfCompartmentMgr* mgr, const char* scope) {
         if (!mgr) return;
         ITfCompartment* conversion = nullptr;
         HRESULT hr = mgr->GetCompartment(GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, &conversion);
@@ -1191,6 +1197,7 @@ bool TextService::SetInputModeCompartments(bool chinese) {
             hr = conversion->SetValue(clientId_, &value);
             NativeLog::Write("SetInputModeCompartments scope=%s conversion mode=%s val=0x%08lX hr=0x%08lX",
                 scope, chinese ? "chinese" : "english", static_cast<unsigned long>(value.lVal), static_cast<unsigned long>(hr));
+            if (SUCCEEDED(hr)) conversionUpdated = true;
             conversion->Release();
         } else {
             NativeLog::Write("SetInputModeCompartments scope=%s GetCompartment(CONVERSION) hr=0x%08lX",
@@ -1211,23 +1218,15 @@ bool TextService::SetInputModeCompartments(bool chinese) {
         }
     };
 
+    // Keep conversion mode scoped to this TSF thread; avoid changing global state.
     ITfCompartmentMgr* threadCompartments = nullptr;
     HRESULT hr = threadMgr_->QueryInterface(IID_ITfCompartmentMgr, reinterpret_cast<void**>(&threadCompartments));
     if (SUCCEEDED(hr) && threadCompartments) {
         setCompartment(threadCompartments, "thread");
         threadCompartments->Release();
-        anySucceeded = true;
-    }
 
-    ITfCompartmentMgr* globalCompartments = nullptr;
-    hr = threadMgr_->GetGlobalCompartment(&globalCompartments);
-    if (SUCCEEDED(hr) && globalCompartments) {
-        setCompartment(globalCompartments, "global");
-        globalCompartments->Release();
-        anySucceeded = true;
     }
-
-    return anySucceeded;
+    return conversionUpdated;
 }
 
 void TextService::RefreshInputModeCompartments() {
