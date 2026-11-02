@@ -100,7 +100,22 @@ export function reduceKey(state: ImeState, event: KeyMessage): Reduction {
     const commit = candidates[index]!.text;
     return { state: { composition: "", selectedCandidate: 0, context: appendContext(state.context, commit) }, consume: true, commit };
   }
-  if (key === " " || key === "Spacebar" || key === "Enter") {
+  if (key === "Enter") {
+    if (!state.composition) return { state, consume: false };
+    // Enter explicitly commits the unfinished pinyin as literal text. Space
+    // remains the candidate-accepting key; do not replace typed pinyin with
+    // a matching candidate when the user presses Enter.
+    return {
+      state: {
+        composition: "",
+        selectedCandidate: 0,
+        ...(state.context ? { context: state.context } : {}),
+      },
+      consume: true,
+      commit: state.composition,
+    };
+  }
+  if (key === " " || key === "Spacebar") {
     if (!state.composition) return { state, consume: false };
     const commit = candidates[(state.candidatePage ?? 0) * 9 + state.selectedCandidate]?.text ?? candidates[(state.candidatePage ?? 0) * 9]?.text ?? state.composition;
     return { state: { composition: "", selectedCandidate: 0, context: appendContext(state.context, commit) }, consume: true, commit };

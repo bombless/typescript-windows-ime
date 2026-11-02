@@ -68,18 +68,18 @@ describe("initial key behavior", () => {
     const backspace = reduceKey(state, { id: 3, session: 1, type: "keyDown", vk: 8, scanCode: 14, key: "Backspace", modifiers: 0 });
     expect(backspace.state).toEqual({ composition: "a", selectedCandidate: 0 });
     const commit = reduceKey(backspace.state, { id: 4, session: 1, type: "keyDown", vk: 13, scanCode: 28, key: "Enter", modifiers: 0 });
-    expect(commit).toEqual({ state: { composition: "", selectedCandidate: 0, context: "啊" }, consume: true, commit: "啊" });
+    expect(commit).toEqual({ state: { composition: "", selectedCandidate: 0 }, consume: true, commit: "a" });
     expect(reduceKey({ composition: "abc", selectedCandidate: 0 }, { id: 5, session: 1, type: "keyDown", vk: 27, scanCode: 1, key: "Escape", modifiers: 0 }))
       .toEqual({ state: { composition: "", selectedCandidate: 0 }, consume: true });
   });
-  it("keeps a bounded committed-text context and clears it at sentence punctuation", () => {
+  it("preserves existing context when Enter commits literal pinyin and clears it at sentence punctuation", () => {
     const previous = "甲".repeat(31);
     const committed = reduceKey(
       { composition: "a", selectedCandidate: 0, context: previous },
       { id: 40, session: 1, type: "keyDown", vk: 13, scanCode: 28, key: "Enter", modifiers: 0 },
     );
-    expect(Array.from(committed.state.context ?? "")).toHaveLength(32);
-    expect(committed.state.context).toBe("甲".repeat(31) + "啊");
+    expect(Array.from(committed.state.context ?? "")).toHaveLength(31);
+    expect(committed.state.context).toBe(previous);
 
     const punctuation = reduceKey(committed.state, {
       id: 41, session: 1, type: "keyDown", vk: 0xbc, scanCode: 0, key: ",", modifiers: 0,
@@ -293,6 +293,25 @@ describe("initial key behavior", () => {
     expect(result.response.commit).toBe("你好");
     expect(result.state).toEqual({ composition: "", selectedCandidate: 0, context: "你好" });
   });
+  it("commits the exact pinyin buffer on Enter even when candidates match, then clears composition", async () => {
+    const { SimpleEngine } = await import("../src/ime/engine.js");
+    const engine = new SimpleEngine();
+    let state = initialImeState();
+    for (const [index, key] of [..."cache"].entries()) {
+      state = engine.processKey({
+        id: 500 + index, session: 1, type: "keyDown", vk: key.charCodeAt(0), scanCode: 0, key, modifiers: 0,
+      }, state).state;
+    }
+    expect(state.composition).toBe("cache");
+    expect(getCandidates("cache").length).toBeGreaterThan(0);
+
+    const enter = { id: 510, session: 1, type: "keyDown" as const, vk: 13, scanCode: 28, key: "Enter", modifiers: 0 };
+    expect(engine.testKey({ ...enter, type: "testKeyDown" }, state)).toEqual({ consume: true });
+    const result = engine.processKey(enter, state);
+    expect(result.response).toMatchObject({ consume: true, composition: "", commit: "cache" });
+    expect(result.state).toEqual({ composition: "", selectedCandidate: 0 });
+  });
+
   it("moves the candidate highlight with arrow keys and commits the chosen number", async () => {
     const { SimpleEngine } = await import("../src/ime/engine.js");
     const engine = new SimpleEngine();
