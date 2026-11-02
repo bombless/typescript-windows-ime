@@ -333,6 +333,49 @@ bool IsCaretRectEmpty(const RECT& rect) {
     return rect.right <= rect.left && rect.bottom <= rect.top;
 }
 
+UINT MonitorDpi(HMONITOR monitor) {
+    // GetDpiForWindow(foreground) can describe an app-specific DPI context,
+    // not the effective DPI of the monitor where this popup is displayed.
+    // TSF caret coordinates follow the foreground app's DPI context, while
+    // this top-level popup is positioned in the Host's desktop coordinate
+    // space. Query the monitor DPI so those two coordinate spaces can be
+    // reconciled before positioning.
+    using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+    HMODULE shcore = LoadLibraryW(L"shcore.dll");
+    if (shcore) {
+        const auto getDpiForMonitor = reinterpret_cast<GetDpiForMonitorFn>(
+            GetProcAddress(shcore, "GetDpiForMonitor"));
+        UINT x = 0;
+        UINT y = 0;
+        const HRESULT hr = getDpiForMonitor ? getDpiForMonitor(monitor, 0, &x, &y) : E_FAIL;
+        FreeLibrary(shcore);
+        if (SUCCEEDED(hr) && x > 0) return x;
+    }
+    const UINT systemDpi = GetDpiForSystem();
+    return systemDpi ? systemDpi : 96;
+}
+
+void NormalizeCaretForMonitor(RECT& caret, UINT& dpi) {
+    HWND foreground = GetForegroundWindow();
+    HMONITOR monitor = foreground
+        ? MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST)
+        : MonitorFromRect(&caret, MONITOR_DEFAULTTONEAREST);
+    if (!monitor) return;
+
+    const UINT appDpi = dpi ? dpi : GetDpiForSystem();
+    const UINT monitorDpi = MonitorDpi(monitor);
+    if (appDpi > 0 && monitorDpi > 0 && appDpi != monitorDpi) {
+        const RECT original = caret;
+        caret.left = MulDiv(caret.left, static_cast<int>(monitorDpi), static_cast<int>(appDpi));
+        caret.top = MulDiv(caret.top, static_cast<int>(monitorDpi), static_cast<int>(appDpi));
+        caret.right = MulDiv(caret.right, static_cast<int>(monitorDpi), static_cast<int>(appDpi));
+        caret.bottom = MulDiv(caret.bottom, static_cast<int>(monitorDpi), static_cast<int>(appDpi));
+        NativeLog::Write("CandidateWindow normalize caret appDpi=%u monitorDpi=%u before=%ld,%ld,%ld,%ld after=%ld,%ld,%ld,%ld",
+            appDpi, monitorDpi, original.left, original.top, original.right, original.bottom,
+            caret.left, caret.top, caret.right, caret.bottom);
+    }
+    dpi = monitorDpi;
+}
 RECT ApplicationRect() {
     HWND foreground = GetForegroundWindow();
     if (!foreground) return RECT{};
@@ -362,39 +405,45 @@ void Place(HWND window, RECT caret) {
         }
     }
     RECT workArea{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
-    const HMONITOR monitor = caret.right > caret.left
-        ? MonitorFromRect(&caret, MONITOR_DEFAULTTONEAREST)
-        : MonitorFromPoint(POINT{ caret.left, caret.top }, MONITOR_DEFAULTTONEAREST);
+    const HMONITOR monitor = MonitorFromRect(&caret, MONITOR_DEFAULTTONEAREST);
     MONITORINFO monitorInfo{};
     monitorInfo.cbSize = sizeof(monitorInfo);
     if (monitor && GetMonitorInfoW(monitor, &monitorInfo)) workArea = monitorInfo.rcWork;
 
-    const int x = ClampToWorkArea(caret.left, workArea.left, workArea.right - g_width);
-    // Prefer the full candidate list. If there is not enough room below the
-    // caret (common when we fall back to the mouse position), place it above
-    // instead; only shrink the list when neither side has enough room.
-    const int desiredHeight = MinInt(g_height, MaxInt(1, workArea.bottom - workArea.top));
-    const int belowY = ClampToWorkArea(caret.bottom, workArea.top, workArea.bottom - 1);
-    const int belowSpace = MaxInt(1, workArea.bottom - belowY);
-    const int aboveSpace = MaxInt(0, caret.top - workArea.top);
+    const int workWidth = MaxInt(1, workArea.right - workArea.left);
+    const int workHeight = MaxInt(1, workArea.bottom - workArea.top);
+    const int width = MinInt(g_width, workWidth);
+    const int desiredHeight = MinInt(g_height, workHeight);
+    const int x = ClampToWorkArea(caret.left, workArea.left, workArea.right - width);
+
+    // TSF clients can return a caret rectangle outside the physical desktop
+    // (for example, a 200%-DPI logical coordinate passed to a 100%-DPI Host).
+    // Normalize it to the nearest edge before deciding which side to use.
+    const int anchorTop = ClampToWorkArea(caret.top, workArea.top, workArea.bottom);
+    const int anchorBottom = ClampToWorkArea(caret.bottom, workArea.top, workArea.bottom);
+    const int belowY = MaxInt(anchorTop, anchorBottom);
+    const int belowSpace = MaxInt(0, workArea.bottom - belowY);
+    const int aboveSpace = MaxInt(0, anchorTop - workArea.top);
     int y = belowY;
     int height = desiredHeight;
     if (belowSpace >= desiredHeight) {
         y = belowY;
     } else if (aboveSpace >= desiredHeight) {
-        y = caret.top - desiredHeight;
+        y = anchorTop - desiredHeight;
     } else if (aboveSpace > belowSpace) {
         height = MaxInt(1, MinInt(desiredHeight, aboveSpace));
-        y = caret.top - height;
+        y = anchorTop - height;
     } else {
         height = MaxInt(1, MinInt(desiredHeight, belowSpace));
         y = belowY;
     }
-    const int width = g_width;
-    if (width <= 0 || height <= 0) return;
-
+    // Final defensive clamp: even malformed/off-screen caret coordinates can
+    // never place any part of the candidate window outside the work area.
+    y = ClampToWorkArea(y, workArea.top, workArea.bottom - height);
+    const int finalWidth = MaxInt(1, width);
+    const int finalHeight = MaxInt(1, height);
     SetLastError(ERROR_SUCCESS);
-    const BOOL positionResult = SetWindowPos(window, HWND_TOPMOST, x, y, width, height,
+    const BOOL positionResult = SetWindowPos(window, HWND_TOPMOST, x, y, finalWidth, finalHeight,
         SWP_NOACTIVATE | SWP_SHOWWINDOW);
     const DWORD positionError = positionResult ? ERROR_SUCCESS : GetLastError();
     SetLastError(ERROR_SUCCESS);
@@ -405,7 +454,7 @@ void Place(HWND window, RECT caret) {
     NativeLog::Write("CandidateWindow placed hwnd=%p setPos=%d setPosError=%lu invalidate=%d invalidateError=%lu caret=%ld,%ld,%ld,%ld at=%d,%d size=%dx%d desiredHeight=%d rect=%ld,%ld,%ld,%ld visible=%d isWindow=%d thread=%lu",
         static_cast<void*>(window), positionResult ? 1 : 0, positionError,
         invalidateResult ? 1 : 0, invalidateError,
-        caret.left, caret.top, caret.right, caret.bottom, x, y, g_width, height, g_height,
+        caret.left, caret.top, caret.right, caret.bottom, x, y, finalWidth, finalHeight, g_height,
         placed.left, placed.top, placed.right, placed.bottom, IsWindowVisible(window) ? 1 : 0,
         IsWindow(window) ? 1 : 0, GetWindowThreadProcessId(window, nullptr));
 }
@@ -487,6 +536,7 @@ bool ShowOnUiThread(const std::vector<std::wstring>& candidates, UINT selection,
         HideOnUiThread();
         return false;
     }
+    NormalizeCaretForMonitor(caret, dpi);
     HWND window = EnsureWindow();
     if (!window) return false;
     if (dpi == 0) dpi = GetDpiForSystem();
