@@ -10,6 +10,15 @@ Windows TSF → C++ native adapter / Named Pipe server → Node.js/TypeScript IM
 
 The first milestone is a reliable end-to-end key event round trip. Business logic stays in TypeScript; C++ is limited to Windows TSF/COM, composition, and IPC glue.
 
+## Wanxiang dictionary data
+
+The candidate engine loads selected Wanxiang tables (`zi`, `duoyin`, `cuoyin`,
+`mingren`, and `yiren`) as supplemental sources after the existing local pinyin
+dictionary. Tone marks are normalized to this project's untoned full-pinyin
+input; `ü` uses the `v` key. This is a partial dictionary integration: the large `jichu` table and
+Rime's Lua grammar model/user-dictionary runtime are not included. See
+`data/WANXIANG-NOTICE.md` for attribution and license details.
+
 ## Development
 
 Requirements: Windows, Node.js 20+, and npm.

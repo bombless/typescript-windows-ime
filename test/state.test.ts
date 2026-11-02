@@ -68,9 +68,23 @@ describe("initial key behavior", () => {
     const backspace = reduceKey(state, { id: 3, session: 1, type: "keyDown", vk: 8, scanCode: 14, key: "Backspace", modifiers: 0 });
     expect(backspace.state).toEqual({ composition: "a", selectedCandidate: 0 });
     const commit = reduceKey(backspace.state, { id: 4, session: 1, type: "keyDown", vk: 13, scanCode: 28, key: "Enter", modifiers: 0 });
-    expect(commit).toEqual({ state: { composition: "", selectedCandidate: 0 }, consume: true, commit: "啊" });
+    expect(commit).toEqual({ state: { composition: "", selectedCandidate: 0, context: "啊" }, consume: true, commit: "啊" });
     expect(reduceKey({ composition: "abc", selectedCandidate: 0 }, { id: 5, session: 1, type: "keyDown", vk: 27, scanCode: 1, key: "Escape", modifiers: 0 }))
       .toEqual({ state: { composition: "", selectedCandidate: 0 }, consume: true });
+  });
+  it("keeps a bounded committed-text context and clears it at sentence punctuation", () => {
+    const previous = "甲".repeat(31);
+    const committed = reduceKey(
+      { composition: "a", selectedCandidate: 0, context: previous },
+      { id: 40, session: 1, type: "keyDown", vk: 13, scanCode: 28, key: "Enter", modifiers: 0 },
+    );
+    expect(Array.from(committed.state.context ?? "")).toHaveLength(32);
+    expect(committed.state.context).toBe("甲".repeat(31) + "啊");
+
+    const punctuation = reduceKey(committed.state, {
+      id: 41, session: 1, type: "keyDown", vk: 0xbc, scanCode: 0, key: ",", modifiers: 0,
+    });
+    expect(punctuation.state).not.toHaveProperty("context");
   });
   it("handles Delete by removing the character at the start of the pinyin composition", () => {
     const key = (state: { composition: string; selectedCandidate: number }, id: number, key: string) =>
@@ -277,7 +291,7 @@ describe("initial key behavior", () => {
     const result = engine.processKey({ id: 13, session: 1, type: "keyDown", vk: 32, scanCode: 0, key: " ", modifiers: 0 }, state);
     expect(result.response.candidates?.[0]?.text).toBe("你好");
     expect(result.response.commit).toBe("你好");
-    expect(result.state).toEqual({ composition: "", selectedCandidate: 0 });
+    expect(result.state).toEqual({ composition: "", selectedCandidate: 0, context: "你好" });
   });
   it("moves the candidate highlight with arrow keys and commits the chosen number", async () => {
     const { SimpleEngine } = await import("../src/ime/engine.js");
@@ -292,7 +306,7 @@ describe("initial key behavior", () => {
     const selected = candidates.response.candidates?.[1]?.text;
     const committed = engine.processKey({ id: 33, session: 1, type: "keyDown", vk: 50, scanCode: 0, key: "2", modifiers: 0 }, candidates.state);
     expect(committed.response.commit).toBe(selected);
-    expect(committed.state).toEqual({ composition: "", selectedCandidate: 0 });
+    expect(committed.state).toEqual({ composition: "", selectedCandidate: 0, context: selected });
   });
   it("indexes known words by display text and preserves multiple dictionary entries", () => {
     expect(getKnownWordEntries("项目").length).toBeGreaterThan(0);

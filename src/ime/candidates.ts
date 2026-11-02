@@ -1,6 +1,7 @@
 import type { Candidate } from "../protocol/messages.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { getGrammarTransitionScore } from "./grammar.js";
 interface Entry { text: string; code: string; weight: number; priority: number; isInitials?: boolean; }
 interface PartialCandidate { text: string; weight: number; trace?: string[]; }
 interface KnownWordEntry { weight: number; priority: number; sourcePriority: number; code: string; }
@@ -18,6 +19,13 @@ interface ContinuationCandidate {
 const CUSTOM_DICTIONARY_PATH = fileURLToPath(new URL("../../data/custom.dict.yaml", import.meta.url));
 const DICTIONARY_PATH = fileURLToPath(new URL("../../data/pinyin_simp.dict.yaml", import.meta.url));
 const MICROSOFT_DICTIONARY_PATH = fileURLToPath(new URL("../../data/microsoft_pinyin.dict.yaml", import.meta.url));
+// Wanxiang's Base dictionary is split across several Rime tables. The very
+// large jichu table is intentionally not duplicated here; these curated,
+// smaller tables add tone-aware character readings, polyphonic words, common
+// corrections, and name coverage to the existing local dictionary.
+const WANXIANG_DICTIONARY_PATHS = ["zi", "duoyin", "cuoyin", "mingren", "yiren"].map((name) =>
+  fileURLToPath(new URL(`../../data/wanxiang_${name}.dict.yaml`, import.meta.url)),
+);
 // Keep enough results available for candidate paging; the UI displays 9 per page.
 const MAX_CANDIDATES = 90;
 
@@ -25,11 +33,23 @@ function normalizeCode(value: string): string {
   return value.toLowerCase().replace(/[\s'’`-]+/g, "");
 }
 
+function normalizeDictionarySyllable(value: string): string {
+  return value.toLowerCase()
+    .replace(/[ǖǘǚǜü]/g, "v")
+    .replace(/u\u0308/g, "v")
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "");
+}
+
+function normalizeDictionaryCode(value: string): string {
+  return value.split(/[\s'’`-]+/).map(normalizeDictionarySyllable).join("");
+}
+
 function toUserText(value: string): string {
   return value.replaceAll("妳", "你");
 }
 
-function loadDictionary(path?: string): Map<string, Entry[]> {
+function loadDictionary(path?: string | readonly string[]): Map<string, Entry[]> {
   const entries = new Map<string, Entry[]>();
 
   const addFile = (path: string, priority: number): void => {
@@ -42,7 +62,10 @@ function loadDictionary(path?: string): Map<string, Entry[]> {
       const text = columns[0]?.trim() ?? "";
       if (!text) continue;
       const rawCode = columns[1]?.trim() ?? "";
-      const code = normalizeCode(rawCode);
+      // Wanxiang stores tone-marked pinyin (e.g. "ā bǎo"). The current
+      // keyboard layout is untoned full pinyin, so normalize marks away while
+      // preserving ü as the conventional v key (lǜ -> lv).
+      const code = normalizeDictionaryCode(rawCode);
       if (!/^[a-z]+$/.test(code)) continue;
       const rawWeight = columns[2]?.trim() ?? "";
       const weight = rawWeight.endsWith("%") ? 0 : Number.parseFloat(rawWeight);
@@ -55,7 +78,7 @@ function loadDictionary(path?: string): Map<string, Entry[]> {
       addEntry(code, entry);
       // Rime-style dictionaries preserve syllable boundaries with spaces. Add
       // an initials alias (e.g. "da jia" -> "dj") for abbreviated input.
-      const syllables = rawCode.toLowerCase().split(/[\s'’`-]+/).filter(Boolean);
+      const syllables = rawCode.split(/[\s'’`-]+/).filter(Boolean).map(normalizeDictionarySyllable);
       if (syllables.length > 1 && syllables.every((syllable) => /^[a-z]+$/.test(syllable))) {
         const initials = syllables.map((syllable) => syllable[0]).join("");
         if (initials !== code) addEntry(initials, { ...entry, code: initials, isInitials: true });
@@ -64,7 +87,8 @@ function loadDictionary(path?: string): Map<string, Entry[]> {
   };
 
   if (path) {
-    addFile(path, 0);
+    const paths = typeof path === "string" ? [path] : path;
+    paths.forEach((dictionaryPath, priority) => addFile(dictionaryPath, priority));
   } else {
     addFile(CUSTOM_DICTIONARY_PATH, 0);
     addFile(DICTIONARY_PATH, 1);
@@ -79,7 +103,11 @@ function loadDictionary(path?: string): Map<string, Entry[]> {
 let customDictionary: Map<string, Entry[]> | undefined;
 function getCustomDictionary(): Map<string, Entry[]> { return customDictionary ??= loadDictionary(CUSTOM_DICTIONARY_PATH); }
 let dictionary: Map<string, Entry[]> | undefined;
-function getDictionary(): Map<string, Entry[]> { return dictionary ??= loadDictionary(DICTIONARY_PATH); }
+function getDictionary(): Map<string, Entry[]> {
+  // Keep the project's established dictionary ranking stable; Wanxiang fills
+  // gaps and contributes alternatives after existing local entries.
+  return dictionary ??= loadDictionary([DICTIONARY_PATH, ...WANXIANG_DICTIONARY_PATHS]);
+}
 let microsoftDictionary: Map<string, Entry[]> | undefined;
 function getMicrosoftDictionary(): Map<string, Entry[]> {
   if (microsoftDictionary) return microsoftDictionary;
@@ -127,7 +155,7 @@ export function getKnownWordEntries(text: string): ReadonlyArray<KnownWordEntry>
   return getWordIndex().get(toUserText(text)) ?? [];
 }
 
-function queryDictionary(composition: string, sourceDictionary: Map<string, Entry[]>): Candidate[] {
+function queryDictionary(composition: string, sourceDictionary: Map<string, Entry[]>, context = ""): Candidate[] {
   const query = normalizeCode(composition);
   if (!query) return [];
   const exact = sourceDictionary.get(query) ?? [];
@@ -149,7 +177,7 @@ function queryDictionary(composition: string, sourceDictionary: Map<string, Entr
       .flatMap(([, entries]) => entries.filter((entry) =>
         !entry.isInitials && [...toUserText(entry.text)].length === 1,
       ))
-      .sort((a, b) => b.weight - a.weight || a.priority - b.priority || a.code.localeCompare(b.code));
+      .sort((a, b) => a.priority - b.priority || b.weight - a.weight || a.code.localeCompare(b.code));
     const seenSingleCharacters = new Set<string>();
     const singleCharacterCandidates = singleCharacterEntries
       .map(toCandidate)
@@ -212,10 +240,19 @@ function queryDictionary(composition: string, sourceDictionary: Map<string, Entr
       if (!target) continue;
       for (const prefix of current) {
         for (const entry of topEntries) {
+          // Octagram scores each newly appended dictionary word against the
+          // already decoded context. Keep the native model score separate
+          // from raw dictionary frequencies by mapping its log-scale units
+          // into the existing candidate score range.
+          const grammarScore = getGrammarTransitionScore(
+            context + prefix.text,
+            entry.text,
+            next === query.length,
+          );
           target.push({
             text: prefix.text + entry.text,
-            weight: prefix.weight + entry.weight - 100,
-            ...(traceEnabled ? { trace: [...(prefix.trace ?? []), `${code} -> ${entry.text} (dict code: ${entry.code}, weight: ${entry.weight})`] } : {}),
+            weight: prefix.weight + entry.weight - 100 + grammarScore * 100_000,
+            ...(traceEnabled ? { trace: [...(prefix.trace ?? []), `${code} -> ${entry.text} (dict code: ${entry.code}, weight: ${entry.weight}, grammar: ${grammarScore.toFixed(3)})`] } : {}),
           });
         }
       }
@@ -251,14 +288,14 @@ function queryDictionary(composition: string, sourceDictionary: Map<string, Entr
     .map((entry, index) => ({ ...entry, index }));
 }
 
-export function getCandidates(composition: string): Candidate[] {
+export function getCandidates(composition: string, context = ""): Candidate[] {
   const query = normalizeCode(composition);
   // Custom entries are exact matches only; never use them for composition or prefix suggestions.
   const custom = (getCustomDictionary().get(query) ?? [])
     .map((entry) => ({ text: toUserText(entry.text), index: 0, annotation: entry.code }))
     .filter((candidate, index, list) => list.findIndex((item) => item.text === candidate.text) === index)
     .slice(0, MAX_CANDIDATES);
-  const primary = queryDictionary(composition, getDictionary());
+  const primary = queryDictionary(composition, getDictionary(), context);
   const combined = [...custom, ...primary];
   // Apply the one-letter rule across dictionary sources too: a custom multi-
   // character entry must not outrank available single-character candidates.
@@ -276,7 +313,7 @@ export function getCandidates(composition: string): Candidate[] {
     return deduplicated.slice(0, MAX_CANDIDATES).map((candidate, index) => ({ ...candidate, index }));
   }
 
-  const microsoft = queryDictionary(composition, getMicrosoftDictionary());
+  const microsoft = queryDictionary(composition, getMicrosoftDictionary(), context);
   if (microsoft.length > 0) return microsoft;
 
   // Incremental continuation fallback: when the whole input has no candidates,
@@ -287,7 +324,7 @@ export function getCandidates(composition: string): Candidate[] {
   for (let split = query.length - 1; split >= 1; split--) {
     const prefix = query.slice(0, split);
     const suffix = query.slice(split);
-    const prefixCandidates = getCandidates(prefix);
+    const prefixCandidates = getCandidates(prefix, context);
     if (prefixCandidates.length === 0) continue;
 
     const suffixCandidates = queryDictionary(suffix, getDictionary())

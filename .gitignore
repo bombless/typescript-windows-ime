@@ -4,6 +4,7 @@ dist/
 /native/build
 /native/install
 *.obj
+data/wanxiang-lts-zh-hans.gram
 
 # Generated artifacts for the Go TSF binding prototype
 /native/golang/strategy-generated-bindings/build/

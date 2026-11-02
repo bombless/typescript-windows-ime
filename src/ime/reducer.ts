@@ -4,6 +4,10 @@ import type { ImeState } from "./state.js";
 
 export interface Reduction { state: ImeState; consume: boolean; commit?: string; }
 
+function appendContext(context: string | undefined, text: string): string {
+  return Array.from((context ?? "") + text).slice(-32).join("");
+}
+
 export function reduceKey(state: ImeState, event: KeyMessage): Reduction {
   if (event.type !== "keyDown") return { state, consume: false };
   const key = event.key;
@@ -13,7 +17,13 @@ export function reduceKey(state: ImeState, event: KeyMessage): Reduction {
   if (key === "Shift" && (event.modifiers & (2 | 4 | 8)) === 0) {
     const pendingPinyin = mode === "chinese" ? state.composition : "";
     return {
-      state: { composition: "", selectedCandidate: 0, mode: mode === "chinese" ? "english" : "chinese", shiftToggleOrigin: mode },
+      state: {
+        composition: "",
+        selectedCandidate: 0,
+        mode: mode === "chinese" ? "english" : "chinese",
+        shiftToggleOrigin: mode,
+        ...(state.context ? { context: state.context } : {}),
+      },
       consume: true,
       ...(pendingPinyin ? { commit: pendingPinyin } : {}),
     };
@@ -50,9 +60,10 @@ export function reduceKey(state: ImeState, event: KeyMessage): Reduction {
     ? ({ 0xba: "：", 0xbc: "《", 0xbe: "》" } as Record<number, string>)[event.vk]
     : punctuationByVk[event.vk];
   if (punctuation) {
+    // Sentence punctuation ends the local collocation window.
     return { state: { composition: "", selectedCandidate: 0 }, consume: true, commit: punctuation };
   }
-  const candidates = getCandidates(state.composition);
+  const candidates = getCandidates(state.composition, state.context ?? "");
   if (/^[A-Za-z]$/.test(key)) return { state: { ...state, composition: state.composition + key.toLowerCase(), selectedCandidate: 0, ...(state.candidatePage !== undefined ? { candidatePage: 0 } : {}) }, consume: true };
   if (key === "Backspace") {
     if (!state.composition) return { state, consume: false };
@@ -64,7 +75,7 @@ export function reduceKey(state: ImeState, event: KeyMessage): Reduction {
   }
   if (key === "Escape") {
     if (!state.composition) return { state, consume: false };
-    return { state: { composition: "", selectedCandidate: 0 }, consume: true };
+    return { state: { composition: "", selectedCandidate: 0, ...(state.context ? { context: state.context } : {}) }, consume: true };
   }
   // Minus moves to the previous page; equals moves forward.
   if (["-", "="].includes(key)) {
@@ -86,12 +97,13 @@ export function reduceKey(state: ImeState, event: KeyMessage): Reduction {
   if (/^[1-9]$/.test(key) && state.composition) {
     const index = (state.candidatePage ?? 0) * 9 + Number(key) - 1;
     if (index >= candidates.length) return { state, consume: false };
-    return { state: { composition: "", selectedCandidate: 0 }, consume: true, commit: candidates[index]!.text };
+    const commit = candidates[index]!.text;
+    return { state: { composition: "", selectedCandidate: 0, context: appendContext(state.context, commit) }, consume: true, commit };
   }
   if (key === " " || key === "Spacebar" || key === "Enter") {
     if (!state.composition) return { state, consume: false };
-    return { state: { composition: "", selectedCandidate: 0 }, consume: true,
-      commit: candidates[(state.candidatePage ?? 0) * 9 + state.selectedCandidate]?.text ?? candidates[(state.candidatePage ?? 0) * 9]?.text ?? state.composition };
+    const commit = candidates[(state.candidatePage ?? 0) * 9 + state.selectedCandidate]?.text ?? candidates[(state.candidatePage ?? 0) * 9]?.text ?? state.composition;
+    return { state: { composition: "", selectedCandidate: 0, context: appendContext(state.context, commit) }, consume: true, commit };
   }
   return { state, consume: false };
 }

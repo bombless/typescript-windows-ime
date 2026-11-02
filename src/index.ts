@@ -1,7 +1,9 @@
 import { startPipeClient, PIPE_NAME, type PipeClient } from "./pipe/client.js";
+import { preloadWanxiangGrammar } from "./ime/grammar.js";
 
 let client: PipeClient | undefined;
 let shuttingDown = false;
+void preloadWanxiangGrammar();
 function log(message: string, error = false): void {
   const now = new Date();
   const pad = (n: number, width = 2) => String(n).padStart(width, "0");
