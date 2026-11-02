@@ -1,4 +1,5 @@
 #include "CandidateWindow.h"
+#include "CandidateWindowGeometry.h"
 
 #include "NativeLog.h"
 
@@ -49,7 +50,7 @@ int MaxInt(int left, int right) { return left > right ? left : right; }
 int ClampToWorkArea(int value, int low, int high) { return MinInt(MaxInt(value, low), MaxInt(high, low)); }
 bool IsCaretRectEmpty(const RECT& rect);
 RECT ApplicationRect();
-void Place(HWND window, RECT caret);
+void Place(HWND window, RECT caret, HMONITOR monitor);
 
 HMODULE ModuleHandle() {
     HMODULE module = nullptr;
@@ -355,26 +356,57 @@ UINT MonitorDpi(HMONITOR monitor) {
     return systemDpi ? systemDpi : 96;
 }
 
-void NormalizeCaretForMonitor(RECT& caret, UINT& dpi) {
+HMONITOR NormalizeCaretForMonitor(RECT& caret, UINT& dpi) {
     HWND foreground = GetForegroundWindow();
-    HMONITOR monitor = foreground
-        ? MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST)
-        : MonitorFromRect(&caret, MONITOR_DEFAULTTONEAREST);
-    if (!monitor) return;
+    const HMONITOR caretMonitor = MonitorFromRect(&caret, MONITOR_DEFAULTTONEAREST);
+    const HMONITOR foregroundMonitor = foreground
+        ? MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) : nullptr;
+    // TSF caret geometry is the anchor. The foreground HWND is useful for
+    // logical-to-physical conversion only when it is on the same monitor;
+    // otherwise its monitor origin can shift a caret belonging to another
+    // display (notably a display above/left of the primary).
+    HMONITOR sourceMonitor = caretMonitor ? caretMonitor : foregroundMonitor;
+    if (!sourceMonitor) return nullptr;
 
     const UINT appDpi = dpi ? dpi : GetDpiForSystem();
-    const UINT monitorDpi = MonitorDpi(monitor);
-    if (appDpi > 0 && monitorDpi > 0 && appDpi != monitorDpi) {
-        const RECT original = caret;
-        caret.left = MulDiv(caret.left, static_cast<int>(monitorDpi), static_cast<int>(appDpi));
-        caret.top = MulDiv(caret.top, static_cast<int>(monitorDpi), static_cast<int>(appDpi));
-        caret.right = MulDiv(caret.right, static_cast<int>(monitorDpi), static_cast<int>(appDpi));
-        caret.bottom = MulDiv(caret.bottom, static_cast<int>(monitorDpi), static_cast<int>(appDpi));
-        NativeLog::Write("CandidateWindow normalize caret appDpi=%u monitorDpi=%u before=%ld,%ld,%ld,%ld after=%ld,%ld,%ld,%ld",
-            appDpi, monitorDpi, original.left, original.top, original.right, original.bottom,
-            caret.left, caret.top, caret.right, caret.bottom);
+    MONITORINFO sourceInfo{};
+    sourceInfo.cbSize = sizeof(sourceInfo);
+    if (!GetMonitorInfoW(sourceMonitor, &sourceInfo)) return sourceMonitor;
+
+    const RECT original = caret;
+    bool convertedByWindows = false;
+    if (foreground && foregroundMonitor == sourceMonitor && appDpi > 0) {
+        // Windows performs the per-monitor logical-to-physical conversion,
+        // including the non-zero/negative virtual-desktop origin.
+        POINT points[] = { { caret.left, caret.top }, { caret.right, caret.bottom } };
+        const BOOL first = LogicalToPhysicalPointForPerMonitorDPI(foreground, &points[0]);
+        const BOOL second = LogicalToPhysicalPointForPerMonitorDPI(foreground, &points[1]);
+        if (first && second) {
+            caret = RECT{ points[0].x, points[0].y, points[1].x, points[1].y };
+            convertedByWindows = true;
+        }
     }
-    dpi = monitorDpi;
+    if (!convertedByWindows) {
+        // Compatibility fallback: scale offsets from the source monitor origin,
+        // never absolute desktop coordinates (which corrupts negative origins).
+        const UINT sourceDpi = appDpi ? appDpi : 96;
+        const UINT sourceMonitorDpi = MonitorDpi(sourceMonitor);
+        const POINT origin{ sourceInfo.rcMonitor.left, sourceInfo.rcMonitor.top };
+        caret = CandidateWindowGeometry::ScaleRectFromOrigin(caret, origin,
+            sourceDpi, sourceMonitorDpi);
+    }
+
+    HMONITOR targetMonitor = MonitorFromRect(&caret, MONITOR_DEFAULTTONEAREST);
+    if (!targetMonitor) targetMonitor = sourceMonitor;
+    const UINT targetDpi = MonitorDpi(targetMonitor);
+    if (targetDpi) dpi = targetDpi;
+    NativeLog::Write("CandidateWindow normalize caret sourceHwnd=%p sourceMonitor=%p targetMonitor=%p appDpi=%u targetDpi=%u method=%s before=%ld,%ld,%ld,%ld after=%ld,%ld,%ld,%ld",
+        static_cast<void*>(foreground), static_cast<void*>(sourceMonitor),
+        static_cast<void*>(targetMonitor), appDpi, targetDpi,
+        convertedByWindows ? "windows-api" : "origin-relative-fallback",
+        original.left, original.top, original.right, original.bottom,
+        caret.left, caret.top, caret.right, caret.bottom);
+    return targetMonitor;
 }
 RECT ApplicationRect() {
     HWND foreground = GetForegroundWindow();
@@ -389,7 +421,7 @@ RECT ApplicationRect() {
     return rect;
 }
 
-void Place(HWND window, RECT caret) {
+void Place(HWND window, RECT caret, HMONITOR monitor) {
     if (!window || !IsWindow(window)) return;
     if (IsCaretRectEmpty(caret)) {
         // Some TSF clients do not provide a caret rectangle. The foreground
@@ -405,7 +437,7 @@ void Place(HWND window, RECT caret) {
         }
     }
     RECT workArea{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
-    const HMONITOR monitor = MonitorFromRect(&caret, MONITOR_DEFAULTTONEAREST);
+    if (!monitor) monitor = MonitorFromRect(&caret, MONITOR_DEFAULTTONEAREST);
     MONITORINFO monitorInfo{};
     monitorInfo.cbSize = sizeof(monitorInfo);
     if (monitor && GetMonitorInfoW(monitor, &monitorInfo)) workArea = monitorInfo.rcWork;
@@ -459,7 +491,7 @@ void Place(HWND window, RECT caret) {
         IsWindow(window) ? 1 : 0, GetWindowThreadProcessId(window, nullptr));
 }
 
-bool Measure(int& width, int& height) {
+bool Measure(int& width, int& height, HMONITOR monitor) {
     HDC dc = GetDC(nullptr);
     if (!dc) return false;
     HGDIOBJ oldFont = SelectObject(dc, g_font);
@@ -476,9 +508,6 @@ bool Measure(int& width, int& height) {
     // Size to the measured text instead of imposing the old 360-DIP cap.
     // Bound the popup to the active monitor's work area to avoid off-screen UI.
     int availableWidth = GetSystemMetrics(SM_CXSCREEN) - Scale(16);
-    HWND foreground = GetForegroundWindow();
-    HMONITOR monitor = foreground
-        ? MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) : nullptr;
     MONITORINFO monitorInfo{};
     monitorInfo.cbSize = sizeof(monitorInfo);
     if (monitor && GetMonitorInfoW(monitor, &monitorInfo)) {
@@ -536,7 +565,16 @@ bool ShowOnUiThread(const std::vector<std::wstring>& candidates, UINT selection,
         HideOnUiThread();
         return false;
     }
-    NormalizeCaretForMonitor(caret, dpi);
+    if (IsCaretRectEmpty(caret)) {
+        POINT cursor{};
+        if (GetCursorPos(&cursor)) {
+            caret = RECT{ cursor.x, cursor.y, cursor.x + 1, cursor.y + 1 };
+            NativeLog::Write("CandidateWindow cursor fallback %ld,%ld", cursor.x, cursor.y);
+        } else {
+            caret = ApplicationRect();
+        }
+    }
+    HMONITOR monitor = NormalizeCaretForMonitor(caret, dpi);
     HWND window = EnsureWindow();
     if (!window) return false;
     if (dpi == 0) dpi = GetDpiForSystem();
@@ -546,11 +584,11 @@ bool ShowOnUiThread(const std::vector<std::wstring>& candidates, UINT selection,
     g_candidates.assign(candidates.begin(), candidates.begin() + visible);
     g_selection = selection < g_candidates.size() ? selection : 0;
 
-    if (!Measure(g_width, g_height)) return false;
+    if (!Measure(g_width, g_height, monitor)) return false;
 
     // Repaint synchronously: the key handler must not return before the list is
     // on screen, and some hosts keep their message loop busy afterwards.
-    Place(window, caret);
+    Place(window, caret, monitor);
     // Place already shows the window through SetWindowPos, but ShowWindow is
     // still needed: a window that has never been shown has no DWM redirection
     // surface, and without one nothing this window paints is ever presented,
@@ -634,6 +672,12 @@ LRESULT CALLBACK SinkProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
 // aimed at the candidate window arrive on this same queue and are dispatched to
 // WindowProc like any other thread message.
 DWORD WINAPI UiThreadMain(LPVOID) {
+    // CandidateWindow owns physical desktop coordinates after normalization.
+    // Keep the UI thread per-monitor aware so Win32 does not virtualize them
+    // again when positioning the popup on a mixed-DPI virtual desktop.
+    const DPI_AWARENESS_CONTEXT previousDpiContext =
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    NativeLog::Write("CandidateWindow UI thread DPI context set=%d", previousDpiContext ? 1 : 0);
     MSG seed{};
     PeekMessageW(&seed, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 

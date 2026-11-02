@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "CandidateWindow.h"
+#include "CandidateWindowGeometry.h"
 
 namespace {
 
@@ -62,6 +63,34 @@ void Say(const char* format, ...) {
     std::fflush(stdout);
 }
 
+void ScenarioOriginGeometry() {
+    // Synthetic virtual-desktop layouts keep this regression deterministic
+    // even when the attached displays currently share the same DPI.
+    const RECT positiveInput{ 668, -880, 700, -840 };
+    const POINT positiveOrigin{ 468, -1080 };
+    const RECT positiveExpected{ 568, -980, 584, -960 };
+    const RECT positiveActual = CandidateWindowGeometry::ScaleRectFromOrigin(
+        positiveInput, positiveOrigin, 192, 96);
+
+    const RECT negativeInput{ -1120, -680, -1080, -640 };
+    const POINT negativeOrigin{ -1920, -1080 };
+    const RECT negativeExpected{ -1520, -880, -1500, -860 };
+    const RECT negativeActual = CandidateWindowGeometry::ScaleRectFromOrigin(
+        negativeInput, negativeOrigin, 192, 96);
+
+    const bool positivePass = std::memcmp(&positiveActual, &positiveExpected, sizeof(RECT)) == 0;
+    const bool negativePass = std::memcmp(&negativeActual, &negativeExpected, sizeof(RECT)) == 0;
+    Say("  origin-scale positive actual=%ld,%ld,%ld,%ld expected=%ld,%ld,%ld,%ld %s\n",
+        positiveActual.left, positiveActual.top, positiveActual.right, positiveActual.bottom,
+        positiveExpected.left, positiveExpected.top, positiveExpected.right, positiveExpected.bottom,
+        positivePass ? "PASS" : "FAIL");
+    Say("  origin-scale negative actual=%ld,%ld,%ld,%ld expected=%ld,%ld,%ld,%ld %s\n",
+        negativeActual.left, negativeActual.top, negativeActual.right, negativeActual.bottom,
+        negativeExpected.left, negativeExpected.top, negativeExpected.right, negativeExpected.bottom,
+        negativePass ? "PASS" : "FAIL");
+    if (!positivePass || !negativePass) ++g_failures;
+}
+
 void Pump(int milliseconds) {
     const DWORD deadline = GetTickCount() + static_cast<DWORD>(milliseconds);
     MSG message{};
@@ -76,6 +105,11 @@ void Pump(int milliseconds) {
 }
 
 Capture CaptureDesktop() {
+    // Desktop pixels and GetSystemMetrics virtual-screen bounds must be read
+    // in physical coordinates, even when a scenario deliberately switches its
+    // test thread to DPI-unaware to emulate a legacy host.
+    const DPI_AWARENESS_CONTEXT previousDpiContext =
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     Capture capture;
     const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
     const int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -107,7 +141,16 @@ Capture CaptureDesktop() {
     DeleteObject(bitmap);
     DeleteDC(memory);
     ReleaseDC(nullptr, screen);
+    if (previousDpiContext) SetThreadDpiAwarenessContext(previousDpiContext);
     return capture;
+}
+
+bool GetPhysicalWindowRect(HWND window, RECT& rect) {
+    const DPI_AWARENESS_CONTEXT previousDpiContext =
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const BOOL result = GetWindowRect(window, &rect);
+    if (previousDpiContext) SetThreadDpiAwarenessContext(previousDpiContext);
+    return result != FALSE;
 }
 
 // A screen capture can lag behind what the compositor has drawn, so every check
@@ -197,14 +240,28 @@ std::vector<std::wstring> MakeCandidates(size_t count) {
     return candidates;
 }
 
-// shcore is not linked; the display DC reports the same scale for the report.
 UINT MonitorDpi(HMONITOR monitor) {
     if (!monitor) return 0;
-    HDC display = CreateDCW(L"DISPLAY", nullptr, nullptr, nullptr);
-    if (!display) return 0;
-    const int dpi = GetDeviceCaps(display, LOGPIXELSX);
-    DeleteDC(display);
-    return dpi > 0 ? static_cast<UINT>(dpi) : 0;
+    const DPI_AWARENESS_CONTEXT previous =
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+    HMODULE shcore = LoadLibraryW(L"shcore.dll");
+    UINT result = 0;
+    if (shcore) {
+        const auto getDpiForMonitor = reinterpret_cast<GetDpiForMonitorFn>(
+            GetProcAddress(shcore, "GetDpiForMonitor"));
+        UINT x = 0;
+        UINT y = 0;
+        const HRESULT hr = getDpiForMonitor ? getDpiForMonitor(monitor, 0, &x, &y) : E_FAIL;
+        FreeLibrary(shcore);
+        if (SUCCEEDED(hr) && x > 0) result = x;
+    }
+    if (!result) {
+        result = GetDpiForSystem();
+        if (!result) result = 96;
+    }
+    if (previous) SetThreadDpiAwarenessContext(previous);
+    return result;
 }
 
 RECT PrimaryWorkArea() {
@@ -988,28 +1045,78 @@ void ScenarioOffScreen(size_t count) {
     CandidateWindow::Hide();
 }
 
+void ScenarioPerMonitorPlacement() {
+    struct MonitorCase { HMONITOR handle; MONITORINFO info; };
+    std::vector<MonitorCase> monitors;
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR monitor, HDC, LPRECT, LPARAM data) -> BOOL {
+        auto* list = reinterpret_cast<std::vector<MonitorCase>*>(data);
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        if (GetMonitorInfoW(monitor, &info)) list->push_back(MonitorCase{ monitor, info });
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&monitors));
+
+    for (size_t i = 0; i < monitors.size(); ++i) {
+        const MONITORINFO& info = monitors[i].info;
+        const LONG x = info.rcWork.left + (info.rcWork.right - info.rcWork.left) / 2;
+        const LONG y = info.rcWork.top + (info.rcWork.bottom - info.rcWork.top) / 2;
+        const RECT caret{ x, y, x + 8, y + 20 };
+        const UINT dpi = MonitorDpi(monitors[i].handle);
+        CandidateWindow::Show(MakeCandidates(5), 0, caret, dpi ? dpi : 96);
+        Pump(250);
+
+        HWND window = FindCandidateWindow();
+        RECT rect{};
+        if (window) GetPhysicalWindowRect(window, rect);
+        const Capture capture = CaptureDesktop();
+        const int hits = window ? CountColor(capture, rect, kHighlight, kTolerance) : 0;
+        const bool inside = rect.left >= info.rcWork.left && rect.top >= info.rcWork.top &&
+            rect.right <= info.rcWork.right && rect.bottom <= info.rcWork.bottom;
+        const bool pass = window && IsWindowVisible(window) && hits > 0 && inside;
+        Say("  monitor[%zu] bounds=%ld,%ld,%ld,%ld dpi=%u popup=%ld,%ld,%ld,%ld "
+            "highlightPixels=%d inside=%s %s\n", i,
+            info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right, info.rcMonitor.bottom,
+            dpi, rect.left, rect.top, rect.right, rect.bottom, hits, inside ? "yes" : "no",
+            pass ? "PASS" : "FAIL");
+        if (!pass) ++g_failures;
+        CandidateWindow::Hide();
+    }
+    if (monitors.empty()) {
+        Say("  no monitors enumerated FAIL\n");
+        ++g_failures;
+    }
+}
+
 void ScenarioEmpty() {
     CandidateWindow::Show({}, 0, RECT{ 100, 100, 108, 120 });
     VerifyOnScreen("empty-list", false);
 }
 
-int CountRowsFromCapture(const Capture& capture) {
-    // Only the selected row is blue, so the number of highlight bands tells how
-    // many rows of the list actually reached the desktop. Anything else on screen
-    // using the same colour would only inflate the count, never hide a failure.
+int CountRowsFromCapture(const Capture& capture, const RECT& windowRect) {
+    // Count highlight bands only inside this candidate window; unrelated blue
+    // UI elsewhere on a multi-monitor desktop must not inflate the result.
+    const int left = windowRect.left > capture.x ? windowRect.left : capture.x;
+    const int top = windowRect.top > capture.y ? windowRect.top : capture.y;
+    const int captureRight = capture.x + capture.width;
+    const int captureBottom = capture.y + capture.height;
+    const int right = windowRect.right < captureRight ? windowRect.right : captureRight;
+    const int bottom = windowRect.bottom < captureBottom ? windowRect.bottom : captureBottom;
+    if (right <= left || bottom <= top) return 0;
+
     int rows = 0;
     bool inside = false;
     const int step = capture.width > 2000 ? 4 : 2;
-    for (int y = 0; y < capture.height; ++y) {
+    for (int y = top; y < bottom; ++y) {
         int hits = 0;
-        const size_t row = static_cast<size_t>(y) * capture.width;
-        for (int x = 0; x < capture.width; x += step) {
-            if (MatchesHighlight(&capture.pixels[(row + static_cast<size_t>(x)) * 4])) ++hits;
+        const size_t row = static_cast<size_t>(y - capture.y) * capture.width;
+        for (int x = left; x < right; x += step) {
+            const size_t column = static_cast<size_t>(x - capture.x);
+            if (MatchesHighlight(&capture.pixels[(row + column) * 4])) ++hits;
         }
         if (hits < 5) {
-        inside = false;
-        continue;
-    }
+            inside = false;
+            continue;
+        }
         if (!inside) ++rows;
         inside = true;
     }
@@ -1081,11 +1188,12 @@ void ScenarioUnawareHost() {
     const Capture capture = CaptureDesktop();
     HWND window = FindCandidateWindow();
     RECT rect{};
-    if (window) GetWindowRect(window, &rect);
+    if (window) GetPhysicalWindowRect(window, rect);
     const int hits = window ? CountColor(capture, rect, kHighlight, kTolerance) : 0;
     // An unaware thread is virtualized: the coordinates it passes to
     // SetWindowPos are logical and the system scales them by the system DPI.
-    const int scale = static_cast<int>(GetDpiForSystem()) / 96;
+    const HMONITOR caretMonitor = MonitorFromRect(&logicalCaret, MONITOR_DEFAULTTONEAREST);
+    const int scale = static_cast<int>(MonitorDpi(caretMonitor)) / 96;
     const LONG expectedLeft = logicalCaret.left * scale;
     const LONG expectedTop = (logicalCaret.top + 20) * scale + scale * 2;
     const long offsetX = rect.left - expectedLeft;
@@ -1106,7 +1214,7 @@ void ScenarioUnawareHost() {
 const char* const kScenarios[] = {
     "centered", "bottom-edge", "off-screen", "empty-list", "overflow",
     "caret-retry", "no-pump", "logged-caret", "unaware-host", "present-timing",
-    "show-sequence", "style-variants", "field-report", "pixel-provenance",
+    "show-sequence", "style-variants", "field-report", "pixel-provenance", "origin-geometry", "per-monitor-placement",
 };
 
 void RunOverflow() {
@@ -1118,7 +1226,7 @@ void RunOverflow() {
     RECT rect{};
     if (window) GetWindowRect(window, &rect);
     const Capture capture = CaptureDesktop();
-    const int bands = CountRowsFromCapture(capture);
+    const int bands = CountRowsFromCapture(capture, rect);
     const RECT work = PrimaryWorkArea();
     const bool onScreen = window && IsWindowVisible(window) != 0 &&
         CountColor(capture, rect, kHighlight, kTolerance) > 0;
@@ -1135,6 +1243,8 @@ void RunOverflow() {
 
 void RunAll(size_t count) {
     Say("running all scenarios with %zu candidates\n", count);
+    ScenarioOriginGeometry();
+    ScenarioPerMonitorPlacement();
     ScenarioCentered(count);
     ScenarioBottomEdge(count);
     ScenarioOffScreen(count);
@@ -1330,6 +1440,10 @@ int wmain(int argc, wchar_t** argv) {
         RunShowSequence();
     } else if (scenario == L"style-variants") {
         RunStyleVariants();
+    } else if (scenario == L"origin-geometry") {
+        ScenarioOriginGeometry();
+    } else if (scenario == L"per-monitor-placement") {
+        ScenarioPerMonitorPlacement();
     } else {
         Say("unknown scenario '%ls'\n", scenario.c_str());
         Say("known scenarios:");
